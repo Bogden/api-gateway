@@ -10,14 +10,13 @@ import type {
 } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
-import { getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import {
   isRetryableError,
   isPaymentRequiredError,
-  timingSafeStringEqual,
+  isAuthorizedV1Request,
   extractApiToken,
   getStickyModel,
   setStickyModel,
@@ -266,10 +265,8 @@ export function buildResponseObject(opts: {
 responsesRouter.post('/responses', async (req: Request, res: Response) => {
   const start = Date.now();
 
-  // Same unified-key auth as the proxy (accepts Bearer or x-api-key).
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  // Same auth as the proxy: unified key OR a provably-non-browser loopback CLI.
+  if (!isAuthorizedV1Request(req)) {
     res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
     return;
   }

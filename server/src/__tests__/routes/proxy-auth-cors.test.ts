@@ -32,10 +32,37 @@ describe('Proxy authentication and CORS', () => {
     app = createApp();
   });
 
-  it('requires the unified API key for loopback chat completions', async () => {
+  // A provably-non-browser loopback caller (no key, but also no Origin and no
+  // Sec-Fetch-Site — i.e. a native CLI like the claude-p fork, not a web page)
+  // is now authorized without the unified key. See isLocalCliRequest in
+  // routes/proxy.ts: the box is single-user and loopback-only, and the browser
+  // header guard below keeps the CSRF/SSRF defense intact.
+  it('accepts a key-less non-browser loopback caller', async () => {
     const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
       messages: [{ role: 'user', content: 'hello' }],
     });
+
+    // Past the 401 gate (routing then fails — no provider keys in the test DB).
+    expect(status).not.toBe(401);
+    expect(body?.error?.type).not.toBe('authentication_error');
+  });
+
+  // …but a key-less loopback request that looks like a browser fetch (carries
+  // Origin or Sec-Fetch-Site) is still rejected — that's the CSRF/SSRF vector
+  // the unified-key check guards (a malicious page reaching http://127.0.0.1).
+  it('rejects a key-less loopback request carrying a browser Origin', async () => {
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'hello' }],
+    }, { Origin: 'https://attacker.example' });
+
+    expect(status).toBe(401);
+    expect(body.error.type).toBe('authentication_error');
+  });
+
+  it('rejects a key-less loopback request carrying Sec-Fetch-Site', async () => {
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'hello' }],
+    }, { 'Sec-Fetch-Site': 'cross-site' });
 
     expect(status).toBe(401);
     expect(body.error.type).toBe('authentication_error');
@@ -43,10 +70,12 @@ describe('Proxy authentication and CORS', () => {
 
   // #103: Claude Code via CC Switch (and other Anthropic-format clients) send
   // the key in the `x-api-key` header, not as an Authorization bearer token.
+  // A wrong key from a browser-shaped request (Origin present, so the local-CLI
+  // exception does not apply) is still rejected.
   it('rejects a wrong key supplied via the x-api-key header', async () => {
     const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
       messages: [{ role: 'user', content: 'hello' }],
-    }, { 'x-api-key': 'api-gateway-wrong-key' });
+    }, { 'x-api-key': 'api-gateway-wrong-key', Origin: 'https://attacker.example' });
 
     expect(status).toBe(401);
     expect(body.error.type).toBe('authentication_error');

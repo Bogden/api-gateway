@@ -16,6 +16,7 @@ import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { publish } from '../services/events.js';
 import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
+import { isTrustedRequest } from '../lib/ip-trust.js';
 
 export const proxyRouter = Router();
 
@@ -57,6 +58,37 @@ export function extractApiToken(req: Request): string | undefined {
   const xApiKey = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader;
   const trimmed = xApiKey?.trim();
   return trimmed || undefined;
+}
+
+// Authorization for the `/v1` surface (OpenAI + native Anthropic routes).
+//
+// A request is authorized when it presents the unified API key (the normal
+// path), OR when it is a provably-non-browser loopback/LAN caller. The second
+// case exists for local CLI tools that cannot present the key: notably the
+// claude-p fork (the Chain Console's interactive backend), whose OAuth/keychain
+// login overrides ANTHROPIC_AUTH_TOKEN, so it sends the Claude credential to
+// whatever ANTHROPIC_BASE_URL points at — see the chain-console memory
+// `claude-p-fork-oauth-overrides-auth-token`. With this exception the fork can
+// drive the gateway DIRECTLY (ANTHROPIC_BASE_URL=http://127.0.0.1:4610) instead
+// of needing an auth-injecting proxy hop in front.
+//
+// This does NOT reopen the CSRF/SSRF hole the unified-key check was guarding
+// (a malicious web page the operator visits can reach http://127.0.0.1): a
+// browser ALWAYS attaches `Origin` on a cross-origin fetch and `Sec-Fetch-Site`
+// on every fetch/navigation, so requiring BOTH to be absent means only a native
+// process (no browser fetch metadata) qualifies. The IP trust policy itself is
+// unchanged (loopback + RFC1918; the gateway binds loopback-only here anyway) —
+// see lib/ip-trust.ts. A request that carries the key is always accepted
+// regardless of these headers.
+export function isLocalCliRequest(req: Request): boolean {
+  if (req.headers['origin'] || req.headers['sec-fetch-site']) return false;
+  return isTrustedRequest(req);
+}
+
+export function isAuthorizedV1Request(req: Request): boolean {
+  const token = extractApiToken(req);
+  if (token && timingSafeStringEqual(token, getUnifiedApiKey())) return true;
+  return isLocalCliRequest(req);
 }
 
 // Sticky sessions: track which model served each "session"
@@ -204,9 +236,7 @@ function buildModelCapabilities(modelId: string, maxOutputTokens: number | null,
 // OpenAI-compatible /models endpoint (used by Hermes for metadata) 
 // shows API models which is linked by the user.
 proxyRouter.get('/models', (req: Request, res: Response) => {
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  if (!isAuthorizedV1Request(req)) {
     res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
     return;
   }
@@ -502,9 +532,7 @@ const EmbeddingsBody = z.object({
 });
 
 proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  if (!isAuthorizedV1Request(req)) {
     res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
     return;
   }
@@ -533,12 +561,12 @@ proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
 
-  // Authenticate with the unified API key for every proxy request, including
-  // loopback callers. Browser pages can reach localhost, so socket locality is
-  // not a reliable authorization boundary.
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  // Authenticate with the unified API key — or accept a provably-non-browser
+  // loopback CLI caller (see isAuthorizedV1Request). Browser pages can reach
+  // localhost, so socket locality alone is not a reliable boundary; the
+  // Origin/Sec-Fetch-Site guard inside isLocalCliRequest keeps the CSRF/SSRF
+  // defense while letting key-less local CLIs (the claude-p fork) through.
+  if (!isAuthorizedV1Request(req)) {
     res.status(401).json({
       error: { message: 'Invalid API key', type: 'authentication_error' },
     });

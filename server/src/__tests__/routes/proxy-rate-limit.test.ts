@@ -10,7 +10,11 @@ async function request(app: Express, headers: Record<string, string> = {}) {
 
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...headers },
+    // Origin makes these key-less requests browser-shaped → they 401 fast at
+    // auth (the local-CLI exception needs no Origin/Sec-Fetch-Site), which is
+    // the precondition this suite relies on: the limiter sits UPSTREAM of auth,
+    // so each request still counts against the per-IP window before the 401.
+    headers: { 'Content-Type': 'application/json', Origin: 'https://attacker.example', ...headers },
     body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
   });
 

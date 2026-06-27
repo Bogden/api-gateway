@@ -71,10 +71,12 @@ describe('Virtual "auto" model', () => {
   });
 
   it('fails when authentication is missing or wrong', async () => {
-    const { status: status1 } = await request(app, 'GET', '/v1/models');
+    // Browser-shaped (Origin present) so the local-CLI exception does not apply
+    // and the unified-key check is what gates the request.
+    const { status: status1 } = await request(app, 'GET', '/v1/models', undefined, { Origin: 'https://attacker.example' });
     expect(status1).toBe(401);
 
-    const { status: status2 } = await request(app, 'GET', '/v1/models', undefined, { Authorization: 'Bearer wrongkey' });
+    const { status: status2 } = await request(app, 'GET', '/v1/models', undefined, { Authorization: 'Bearer wrongkey', Origin: 'https://attacker.example' });
     expect(status2).toBe(401);
   });
 

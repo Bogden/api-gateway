@@ -15,13 +15,13 @@ import {
   recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit,
   PAYMENT_REQUIRED_COOLDOWN_MS,
 } from '../services/ratelimit.js';
-import { getUnifiedApiKey, getDb } from '../db/index.js';
+import { getDb } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
-import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
+import { extractApiToken, isAuthorizedV1Request, getStickyModel, setStickyModel } from './proxy.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
 
 // Anthropic-compatible Messages API (`POST /v1/messages`). This is a thin
@@ -124,13 +124,12 @@ function newMessageId(): string {
 
 // ── Auth (shared with the OpenAI route) ─────────────────────────────────────
 function authenticate(req: Request, res: Response): boolean {
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
-    sendError(res, 401, 'authentication_error', 'Invalid API key');
-    return false;
-  }
-  return true;
+  // Unified key OR a provably-non-browser loopback CLI (the claude-p fork can't
+  // present the key — its OAuth login overrides ANTHROPIC_AUTH_TOKEN). See
+  // isAuthorizedV1Request in routes/proxy.ts.
+  if (isAuthorizedV1Request(req)) return true;
+  sendError(res, 401, 'authentication_error', 'Invalid API key');
+  return false;
 }
 
 // ── Request translation: Anthropic → internal (OpenAI-shaped) ───────────────

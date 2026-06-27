@@ -16,12 +16,12 @@ function fakeRoute(provider: any) {
   return { provider, modelId: 'fake-model', modelDbId: 9999, apiKey: 'k', keyId: 1, platform: 'fake', displayName: 'Fake Model', release: () => {} };
 }
 
-async function post(app: Express, path: string, body: any, key?: string) {
+async function post(app: Express, path: string, body: any, key?: string, extraHeaders: Record<string, string> = {}) {
   const server = app.listen(0);
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+    headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}), ...extraHeaders },
     body: JSON.stringify(body),
   });
   const text = await res.text();
@@ -41,8 +41,10 @@ describe('POST /v1/responses (#96)', () => {
   });
 
   it('rejects requests without a valid unified key (401)', async () => {
-    expect((await post(app, '/v1/responses', { input: 'hi' })).status).toBe(401);
-    expect((await post(app, '/v1/responses', { input: 'hi' }, 'wrong')).status).toBe(401);
+    // Browser-shaped (Origin present) so the local-CLI exception does not apply.
+    const o = { Origin: 'https://attacker.example' };
+    expect((await post(app, '/v1/responses', { input: 'hi' }, undefined, o)).status).toBe(401);
+    expect((await post(app, '/v1/responses', { input: 'hi' }, 'wrong', o)).status).toBe(401);
   });
 
   it('rejects an invalid body (missing input) with 400', async () => {
