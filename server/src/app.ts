@@ -7,6 +7,7 @@ import { keysRouter } from './routes/keys.js';
 import { platformsRouter } from './routes/platforms.js';
 import { modelsRouter } from './routes/models.js';
 import { proxyRouter } from './routes/proxy.js';
+import { anthropicRouter } from './routes/anthropic.js';
 import { responsesRouter } from './routes/responses.js';
 import { fallbackRouter } from './routes/fallback.js';
 import { embeddingsRouter } from './routes/embeddings.js';
@@ -93,6 +94,11 @@ export function createApp() {
     requireAuth(req, res, next);
   }, customRouter);
   app.use('/v1', createProxyRateLimiter());
+  // Native Anthropic Messages API (POST /v1/messages, /v1/messages/count_tokens,
+  // content-negotiated GET /v1/models) translated over the same bandit router —
+  // mounted BEFORE proxyRouter because its /models handler falls through via
+  // next() for non-Anthropic clients. Point ANTHROPIC_BASE_URL at this gateway.
+  app.use('/v1', anthropicRouter);
   app.use('/v1', proxyRouter);
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);
