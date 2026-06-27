@@ -1,7 +1,33 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import type { Express } from 'express';
+import type { Express, Request } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getUnifiedApiKey } from '../../db/index.js';
+import { isLocalCliRequest } from '../../routes/proxy.js';
+
+// The keyless-loopback bypass must trust ONLY the real TCP peer, never
+// X-Forwarded-For (forgeable under TRUST_PROXY=1). isLocalCliRequest reads
+// req.socket.remoteAddress directly, NOT req.ip — these unit cases pin that:
+// the HTTP harness always connects over a loopback socket, so a spoofed-XFF
+// remote attacker can't be reproduced end-to-end here.
+describe('isLocalCliRequest trusts the socket peer, not X-Forwarded-For', () => {
+  const fake = (over: Partial<Request> & { socket?: any }) =>
+    ({ headers: {}, ip: undefined, socket: {}, ...over } as unknown as Request);
+
+  it('rejects a remote socket even when req.ip claims loopback (XFF spoof)', () => {
+    // The exploit shape: remote TCP peer + spoofed X-Forwarded-For: 127.0.0.1
+    // surfacing as req.ip. Must NOT be trusted.
+    expect(isLocalCliRequest(fake({ ip: '127.0.0.1', socket: { remoteAddress: '8.8.8.8' } }))).toBe(false);
+  });
+
+  it('trusts a loopback socket even when req.ip claims a public address', () => {
+    expect(isLocalCliRequest(fake({ ip: '8.8.8.8', socket: { remoteAddress: '127.0.0.1' } }))).toBe(true);
+  });
+
+  it('still rejects a loopback socket carrying browser fetch metadata', () => {
+    expect(isLocalCliRequest(fake({ socket: { remoteAddress: '127.0.0.1' }, headers: { origin: 'https://x.example' } } as any))).toBe(false);
+    expect(isLocalCliRequest(fake({ socket: { remoteAddress: '127.0.0.1' }, headers: { 'sec-fetch-site': 'cross-site' } } as any))).toBe(false);
+  });
+});
 
 async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
   const server = app.listen(0);

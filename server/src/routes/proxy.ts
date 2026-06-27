@@ -16,7 +16,7 @@ import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { publish } from '../services/events.js';
 import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
-import { isTrustedRequest } from '../lib/ip-trust.js';
+import { isTrustedSourceIp } from '../lib/ip-trust.js';
 
 export const proxyRouter = Router();
 
@@ -76,13 +76,20 @@ export function extractApiToken(req: Request): string | undefined {
 // (a malicious web page the operator visits can reach http://127.0.0.1): a
 // browser ALWAYS attaches `Origin` on a cross-origin fetch and `Sec-Fetch-Site`
 // on every fetch/navigation, so requiring BOTH to be absent means only a native
-// process (no browser fetch metadata) qualifies. The IP trust policy itself is
-// unchanged (loopback + RFC1918; the gateway binds loopback-only here anyway) —
-// see lib/ip-trust.ts. A request that carries the key is always accepted
-// regardless of these headers.
+// process (no browser fetch metadata) qualifies. A request that carries the key
+// is always accepted regardless of these headers.
+//
+// IMPORTANT: this keyless bypass trusts ONLY the real TCP peer
+// (`req.socket.remoteAddress`), NOT `req.ip` — `req.ip` honors `X-Forwarded-For`
+// when `TRUST_PROXY=1`, which a remote attacker could spoof as `127.0.0.1`. We
+// must never let the data-plane bypass depend on a forgeable header, regardless
+// of the proxy config (the IP-trust policy in lib/ip-trust.ts is explicitly "a
+// usability feature, not a security boundary"). The default bind is all
+// interfaces (`HOST` defaults to `::`), so the socket peer is the only safe
+// source here. The unified-key path above is unaffected.
 export function isLocalCliRequest(req: Request): boolean {
   if (req.headers['origin'] || req.headers['sec-fetch-site']) return false;
-  return isTrustedRequest(req);
+  return isTrustedSourceIp(req.socket?.remoteAddress);
 }
 
 export function isAuthorizedV1Request(req: Request): boolean {
