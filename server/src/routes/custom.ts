@@ -5,6 +5,7 @@ import { getDb } from '../db/index.js';
 import { clearRateLimitPenalty } from '../services/router.js';
 import { clearPlatformCaches } from '../services/ratelimit.js';
 import { hasProvider, buildProviderFor } from '../providers/index.js';
+import { benchmarkRankFor } from '../lib/intelligence-ranks.js';
 
 export const customRouter = Router();
 
@@ -158,9 +159,13 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
         // Defaults match MODEL_DEFAULTS: middle ranks, no rate limits,
         // tools=true, vision=false, unknown context window.
         const displayName = modelId;
+        // Seed a benchmark-grounded rank when the discovered model matches a known family,
+        // else fall back to the middle-of-pack default (so an unknown model sorts neither
+        // first nor last in the fallback chain). See lib/intelligence-ranks.
+        const intelligenceRank = benchmarkRankFor(modelId) ?? MODEL_DEFAULTS.intelligenceRank;
         const result = insertModel.run(
           slug, modelId, displayName,
-          MODEL_DEFAULTS.intelligenceRank, MODEL_DEFAULTS.speedRank, MODEL_DEFAULTS.sizeLabel,
+          intelligenceRank, MODEL_DEFAULTS.speedRank, MODEL_DEFAULTS.sizeLabel,
           MODEL_DEFAULTS.rpmLimit, MODEL_DEFAULTS.rpdLimit, MODEL_DEFAULTS.tpmLimit, MODEL_DEFAULTS.tpdLimit,
           MODEL_DEFAULTS.monthlyTokenBudget, null, // context_window = unknown
           MODEL_DEFAULTS.supportsVision ? 1 : 0, MODEL_DEFAULTS.supportsTools ? 1 : 0,
