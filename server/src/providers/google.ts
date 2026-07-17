@@ -452,7 +452,9 @@ export class GoogleProvider extends BaseProvider {
       body: JSON.stringify(body),
     }, 60000, options?.abortSignal);
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
+      const errText = await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal);
+      let err: unknown = {};
+      try { err = JSON.parse(errText); } catch { /* non-JSON error body — keep {} so the statusText fallback applies */ }
       throw providerHttpError(res, `Google API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
     }
 
@@ -526,7 +528,9 @@ export class GoogleProvider extends BaseProvider {
       body: JSON.stringify(body),
     }, 60000, options?.abortSignal);
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
+      const errText = await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal);
+      let err: unknown = {};
+      try { err = JSON.parse(errText); } catch { /* non-JSON error body — keep {} so the statusText fallback applies */ }
       throw providerHttpError(res, `Google API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
     }
 

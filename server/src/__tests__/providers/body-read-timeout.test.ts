@@ -23,12 +23,17 @@ describe('post-headers body-read deadline (card c576)', () => {
     }
   });
 
-  /** Start a server that sends 200 + headers, then never writes the body. */
-  async function startStallingServer(): Promise<string> {
+  /**
+   * Start a server that sends `status` + headers, then never writes the body.
+   * With a non-200 status this exercises the ERROR branch (card c1268): the
+   * provider reads the error body to build its message, which must be bounded
+   * by the same deadline as the success path.
+   */
+  async function startStallingServer(status = 200): Promise<string> {
     server = http.createServer((_req, res) => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      // Flush the 200 + headers to the client so fetch() resolves and we enter
-      // the body-read phase — then never write/end the body, so the body
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      // Flush the status + headers to the client so fetch() resolves and we
+      // enter the body-read phase — then never write/end the body, so the body
       // stalls forever. This is exactly the bug: headers arrive, then silence.
       res.flushHeaders();
     });
@@ -53,6 +58,18 @@ describe('post-headers body-read deadline (card c576)', () => {
 
   it('rejects with ProviderTimeoutError when the body stalls after 200 headers', async () => {
     const baseUrl = await startStallingServer();
+    const provider = makeProvider(baseUrl);
+
+    await expect(
+      provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'model-x'),
+    ).rejects.toBeInstanceOf(ProviderTimeoutError);
+  });
+
+  it('rejects with ProviderTimeoutError when a non-200 error body stalls (card c1268)', async () => {
+    // A backend that returns error headers (500) then stalls the body used to
+    // hang the provider attempt in the `!res.ok` error-message read. That read
+    // now goes through readBodyText, so the inactivity deadline trips instead.
+    const baseUrl = await startStallingServer(500);
     const provider = makeProvider(baseUrl);
 
     await expect(

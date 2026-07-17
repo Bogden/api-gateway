@@ -125,7 +125,9 @@ export class OpenAICompatProvider extends BaseProvider {
       // errors (e.g. GLM's pydantic `literal_error`) the full `detail` string
       // is surfaced so the offending field (`loc`) is visible in the log
       // instead of truncated. (#290, #292)
-      const errBody = await res.json().catch(() => undefined);
+      const errText = await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal);
+      let errBody: unknown;
+      try { errBody = JSON.parse(errText); } catch { /* non-JSON error body — leave undefined so the statusText fallback applies */ }
       const detail = extractErrorMessage(errBody) ?? res.statusText;
       throw providerHttpError(res, `${this.name} API error ${res.status}: ${detail}`);
     }
@@ -186,7 +188,9 @@ export class OpenAICompatProvider extends BaseProvider {
     if (!res.ok) {
       // pulls the message out without `any` so we never coerce a graph
       // into a string. (#290)
-      const errBody = await res.json().catch(() => undefined);
+      const errText = await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal);
+      let errBody: unknown;
+      try { errBody = JSON.parse(errText); } catch { /* non-JSON error body — leave undefined so the statusText fallback applies */ }
       const detail = extractErrorMessage(errBody) ?? res.statusText;
       throw providerHttpError(res, `${this.name} API error ${res.status}: ${detail}`);
     }
