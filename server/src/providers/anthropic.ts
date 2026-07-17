@@ -444,7 +444,9 @@ export class AnthropicCompatProvider extends BaseProvider {
     );
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
+      const errText = await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal);
+      let err: unknown = {};
+      try { err = JSON.parse(errText); } catch { /* non-JSON error body — keep {} so the statusText fallback applies */ }
       throw providerHttpError(
         res,
         `${this.name} API error ${res.status}: ${(err as { error?: { message?: string } })?.error?.message ?? res.statusText}`,
@@ -493,7 +495,9 @@ export class AnthropicCompatProvider extends BaseProvider {
     );
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
+      const errText = await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal);
+      let err: unknown = {};
+      try { err = JSON.parse(errText); } catch { /* non-JSON error body — keep {} so the statusText fallback applies */ }
       throw providerHttpError(
         res,
         `${this.name} API error ${res.status}: ${(err as { error?: { message?: string } })?.error?.message ?? res.statusText}`,

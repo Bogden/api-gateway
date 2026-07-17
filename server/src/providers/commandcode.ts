@@ -163,7 +163,7 @@ export class CommandCodeProvider extends BaseProvider {
     }, options?.timeoutMs ?? 120000, options?.abortSignal);
 
     if (!res.ok) {
-      const err = await res.text().catch(() => '');
+      const err = await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal);
       throw providerHttpError(res, `CommandCode API error ${res.status}: ${err}`);
     }
 
@@ -184,7 +184,7 @@ export class CommandCodeProvider extends BaseProvider {
       body: JSON.stringify(body),
     }, options?.timeoutMs ?? 120000, options?.abortSignal);
     if (!res.ok) {
-      const err = await res.text().catch(() => '');
+      const err = await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal);
       throw providerHttpError(res, `CommandCode API error ${res.status}: ${err}`);
     }
 
