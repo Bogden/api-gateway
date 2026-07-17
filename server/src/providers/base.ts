@@ -135,9 +135,21 @@ function linkAbortAndTimeout(
   return { signal: controller.signal, cleanup, timedOut: () => timedOut };
 }
 
+/** Per-read inactivity deadline shared by the streaming reader
+ *  (`readSseStream`) and the buffered reader (`readBodyText`).
+ *  `fetchWithTimeout` only guards connect/headers — its abort timer is cleared
+ *  the moment response HEADERS arrive — so a backend that returns 200 and then
+ *  stalls mid-body would hang the client forever. Every post-headers body read
+ *  gets its own deadline built on this constant. (card c576) */
+export const BODY_READ_INACTIVITY_TIMEOUT_MS = 300000;
+
 export abstract class BaseProvider {
   abstract readonly platform: Platform;
   abstract readonly name: string;
+  /** Inactivity deadline (ms) applied to each buffered body read via
+   *  `readBodyText`. Defaults to the shared 300s constant; tests override it
+   *  to a short value to exercise the stall path without waiting. (card c576) */
+  protected bodyReadTimeoutMs = BODY_READ_INACTIVITY_TIMEOUT_MS;
   /** Providers whose free tier needs no API key (e.g. Kilo's anonymous gateway).
    * When true, the gateway stores a sentinel key row so routing still considers
    * the platform "configured", and the provider omits the Authorization header
@@ -216,7 +228,7 @@ export abstract class BaseProvider {
    */
   protected async *readSseStream(
     res: Response,
-    inactivityTimeoutMs = 300000,
+    inactivityTimeoutMs = BODY_READ_INACTIVITY_TIMEOUT_MS,
     abortSignal?: AbortSignal,
   ): AsyncGenerator<ChatCompletionChunk> {
     const reader = res.body?.getReader();
@@ -286,5 +298,89 @@ export abstract class BaseProvider {
     if (!sawFinishReason) {
       throw new Error(`${this.name} stream ended unexpectedly (no [DONE], no finish_reason) — connection reset or truncated upstream`);
     }
+  }
+
+  /**
+   * Read a (non-streaming) response body fully, in chunks, with the SAME
+   * per-read inactivity deadline and abort-signal cancellation that
+   * `readSseStream` uses. Returns the decoded text; callers `JSON.parse` it
+   * where they previously called `res.json()`.
+   *
+   * Why this exists: `fetchWithTimeout` only bounds connect/headers — once the
+   * 200 headers arrive its abort timer is cleared, so a naked `res.json()` /
+   * `res.text()` against a backend that sends headers and then stalls hangs
+   * forever. This gives every buffered read the same protection the streaming
+   * path already has. (card c576)
+   *
+   * Rejections are `ProviderTimeoutError` (backend stalled — retryable) or
+   * `RequestAbortError` (client disconnected — terminal), matching the rest of
+   * the provider layer so the proxy classifies them correctly.
+   */
+  protected async readBodyText(
+    res: Response,
+    inactivityTimeoutMs = BODY_READ_INACTIVITY_TIMEOUT_MS,
+    abortSignal?: AbortSignal,
+  ): Promise<string> {
+    const reader = res.body?.getReader();
+    if (!reader) {
+      // No streaming body handle available. In production `res.body` is always
+      // a ReadableStream; this branch only trips for buffered/mocked responses
+      // that expose `text()`/`json()` instead. Preserve their content so the
+      // deadline wrapper stays transparent to those callers.
+      if (typeof res.text === 'function') {
+        const t = await res.text();
+        if (t != null) return t;
+      }
+      if (typeof (res as { json?: () => Promise<unknown> }).json === 'function') {
+        return JSON.stringify(await (res as { json: () => Promise<unknown> }).json());
+      }
+      return '';
+    }
+
+    if (abortSignal?.aborted) {
+      reader.cancel().catch(() => { /* upstream already gone */ });
+      throw new RequestAbortError();
+    }
+
+    const decoder = new TextDecoder();
+    let text = '';
+    try {
+      while (true) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const result = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new ProviderTimeoutError(inactivityTimeoutMs)),
+              inactivityTimeoutMs,
+            );
+          }),
+          // If the client aborts, this rejects first and the pending
+          // `reader.read()` is cancelled in `finally`. (card c576)
+          ...(abortSignal ? [new Promise<never>((_, reject) => {
+            abortSignal.addEventListener('abort', () => reject(new RequestAbortError()), { once: true });
+          })] : []),
+        ]).finally(() => clearTimeout(timer));
+
+        const { done, value } = result;
+        if (done) {
+          text += decoder.decode(); // flush any remaining buffered bytes
+          break;
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+    } catch (err) {
+      // When the external signal aborts, `fetch`'s own linked signal can reject
+      // the pending `reader.read()` with a raw `AbortError` that races our
+      // `RequestAbortError`. Normalize either shape to `RequestAbortError` so
+      // callers never misclassify a client disconnect. (card c576)
+      if (abortSignal?.aborted && !(err instanceof ProviderTimeoutError)) {
+        throw new RequestAbortError();
+      }
+      throw err;
+    } finally {
+      reader.cancel().catch(() => { /* upstream already gone */ });
+    }
+    return text;
   }
 }

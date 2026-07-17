@@ -456,7 +456,9 @@ export class GoogleProvider extends BaseProvider {
       throw providerHttpError(res, `Google API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
     }
 
-    const data = await res.json() as GeminiResponse;
+    const data = JSON.parse(
+      await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal),
+    ) as GeminiResponse;
     // Safety/prompt block: Gemini may refuse the request and return an empty
     // candidates array with a blockReason. Throw so the proxy relays the error
     // to the user instead of silently falling over to the next model.

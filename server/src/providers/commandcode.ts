@@ -167,7 +167,7 @@ export class CommandCodeProvider extends BaseProvider {
       throw providerHttpError(res, `CommandCode API error ${res.status}: ${err}`);
     }
 
-    return this.collectNonStreamResponse(res, modelId);
+    return this.collectNonStreamResponse(res, modelId, options?.abortSignal);
   }
 
   async *streamChatCompletion(
@@ -448,8 +448,8 @@ export class CommandCodeProvider extends BaseProvider {
       });
   }
 
-  private async collectNonStreamResponse(res: Response, modelId: string): Promise<ChatCompletionResponse> {
-    const events = await this.readNdjsonEvents(res);
+  private async collectNonStreamResponse(res: Response, modelId: string, abortSignal?: AbortSignal): Promise<ChatCompletionResponse> {
+    const events = await this.readNdjsonEvents(res, abortSignal);
     let content = '';
     let reasoning = '';
     const toolCalls: ChatToolCall[] = [];
@@ -701,8 +701,8 @@ export class CommandCodeProvider extends BaseProvider {
     return 'stop';
   }
 
-  private async readNdjsonEvents(res: Response): Promise<CCStreamEvent[]> {
-    const text = await res.text();
+  private async readNdjsonEvents(res: Response, abortSignal?: AbortSignal): Promise<CCStreamEvent[]> {
+    const text = await this.readBodyText(res, this.bodyReadTimeoutMs, abortSignal);
     const events: CCStreamEvent[] = [];
     for (const line of text.split('\n')) {
       const trimmed = line.trim();

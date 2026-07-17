@@ -8,7 +8,7 @@ import type {
   TokenUsage,
   Platform,
 } from '@api-gateway/shared/types.js';
-import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, ProviderTimeoutError, RequestAbortError, type CompletionOptions } from './base.js';
 import { contentToString, normalizeOutboundContent } from '../lib/content.js';
 import { anthropicThinking, normalizeThinking } from '../lib/thinking.js';
 
@@ -453,8 +453,14 @@ export class AnthropicCompatProvider extends BaseProvider {
 
     let raw: AnthropicResponse;
     try {
-      raw = await res.json() as AnthropicResponse;
-    } catch {
+      raw = JSON.parse(
+        await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal),
+      ) as AnthropicResponse;
+    } catch (err) {
+      // A stalled body read or client disconnect is not a "non-Anthropic" body
+      // — rethrow the timeout/abort so the proxy handles it correctly rather
+      // than reporting a bogus base-URL error. (card c576)
+      if (err instanceof ProviderTimeoutError || err instanceof RequestAbortError) throw err;
       throw new Error(
         `${this.name} returned 200 with a non-JSON body — the endpoint is not Anthropic-compatible. ` +
         `Check the base URL points at an Anthropic Messages API root (e.g. https://api.anthropic.com).`,
