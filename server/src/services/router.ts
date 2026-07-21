@@ -471,6 +471,11 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
   if (strategy !== 'priority') refreshStatsCache(db);
 
   // Get the enabled fallback chain joined with the fields the scorer needs.
+  //
+  // The ChatGPT (Codex plan) provider is deliberately excluded from the
+  // auto-routing chain: a paid subscription must never be auto-selected by the
+  // free-cascade bandit. Its models are reachable only when explicitly pinned
+  // (see the pinned-model bypass below).
   const chain = db.prepare(`
     SELECT fc.model_db_id, fc.priority, fc.enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
@@ -479,7 +484,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
            m.supports_tools, m.context_window, m.max_output_tokens, m.key_id
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
-    WHERE fc.enabled = 1
+    WHERE fc.enabled = 1 AND m.platform != 'chatgpt'
   `).all() as ChainRow[];
 
   const sortedChain = orderChain(chain, strategy);
@@ -490,6 +495,22 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     if (idx > 0) {
       const [preferred] = sortedChain.splice(idx, 1);
       sortedChain.unshift(preferred);
+    } else if (idx < 0) {
+      // Pinned-model bypass: a model that the client pinned but that isn't in
+      // the auto-routing chain (e.g. a ChatGPT/Codex plan model, which is
+      // excluded above) is still routable when explicitly requested. Load its
+      // row directly and place it at the front. Absent from the DB → nothing to
+      // add, and the loop below falls through to the normal exhausted path.
+      const pinned = db.prepare(`
+        SELECT m.id AS model_db_id, 0 AS priority, 1 AS enabled,
+               m.platform, m.model_id, m.display_name, m.intelligence_rank,
+               m.size_label, m.monthly_token_budget,
+               m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+               m.supports_tools, m.context_window, m.max_output_tokens, m.key_id
+        FROM models m
+        WHERE m.id = ? AND m.enabled = 1
+      `).get(preferredModelDbId) as ChainRow | undefined;
+      if (pinned) sortedChain.unshift(pinned);
     }
   }
 

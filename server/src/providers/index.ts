@@ -7,6 +7,7 @@ import { CohereProvider } from './cohere.js';
 import { GoogleProvider } from './google.js';
 import { AnthropicCompatProvider } from './anthropic.js';
 import { CommandCodeProvider } from './commandcode.js';
+import { ChatGptProvider } from './chatgpt.js';
 
 
 const providers = new Map<Platform, BaseProvider>();
@@ -17,6 +18,13 @@ function register(provider: BaseProvider) {
 
 // Google - unique Gemini API format
 register(new GoogleProvider());
+
+// ChatGPT subscription (Codex plan) — Anthropic-wire clients (Claude Code fork
+// via CC Switch) on a ChatGPT plan. Translates to the OpenAI Responses API and
+// authenticates via the Codex CLI credential store. Selected only for gpt-*
+// model ids; excluded from the free-cascade auto bandit (see router.ts). No
+// API key — keyless, creds live in ~/.codex/auth.json.
+register(new ChatGptProvider());
 
 // Groq - OpenAI-compatible
 register(new OpenAICompatProvider({

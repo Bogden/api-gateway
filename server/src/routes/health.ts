@@ -3,6 +3,7 @@ import type { Request, Response } from 'express';
 import { getDb } from '../db/index.js';
 import { checkKeyHealth, checkAllKeys } from '../services/health.js';
 import { hasProvider } from '../providers/index.js';
+import { getActiveChatgptCooldowns } from '../services/chatgpt-cooldown.js';
 
 export const healthRouter = Router();
 
@@ -51,6 +52,11 @@ healthRouter.get('/', (_req: Request, res: Response) => {
       createdAt: k.created_at,
       lastCheckedAt: k.last_checked_at,
     })),
+    // ChatGPT (Codex plan) subscription cooldowns. Non-empty when the plan hit
+    // a 429/usage-window limit; each entry lapses at `expiresAt`. Consumed by
+    // status/analytics tooling to show the plan is throttled (never a silent
+    // fallback to another provider). Empty array when nothing is cooling down.
+    chatgptCooldowns: getActiveChatgptCooldowns(),
   });
 });
 

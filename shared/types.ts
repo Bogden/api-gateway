@@ -29,7 +29,11 @@ export type Platform =
   // OVHcloud AI Endpoints — OpenAI-compatible, keyless anonymous tier
   // (2 req/min per IP per model); see migrateModelsV26.
   | 'ovh'
-  | 'commandcode';
+  | 'commandcode'
+  // ChatGPT subscription (Codex plan) — reached only for gpt-* model ids,
+  // authenticated via the Codex CLI credential store (~/.codex/auth.json).
+  // Pin-only: excluded from the free-cascade auto bandit. See providers/chatgpt.ts.
+  | 'chatgpt';
 // NOTE: the literal string 'custom' is no longer a special platform. Users add
 // their own OpenAI-compatible providers (ollama, llama.cpp, LM Studio, vLLM,
 // any base_url) via POST /api/custom-providers, and the resulting slug becomes

@@ -30,6 +30,39 @@ function isAutoModel(modelId: string | undefined): boolean {
   return modelId === AUTO_MODEL_ID;
 }
 
+// ChatGPT (Codex plan) model resolution. Any requested id matching /^gpt-/
+// (optionally prefixed with `chatgpt/`) belongs to the `chatgpt` provider.
+// Catalog rows are auto-provisioned on first use so arbitrary gpt-* ids resolve
+// without a manual catalog edit; the row is NOT added to fallback_config, and
+// the router excludes platform 'chatgpt' from auto-routing, so it stays
+// pin-only. Returns the model row id, or undefined when the id isn't gpt-*.
+export function ensureChatgptModel(
+  db: ReturnType<typeof getDb>,
+  requestedModel: string,
+): { id: number } | undefined {
+  const m = /^(?:chatgpt\/)?(gpt-.+)$/i.exec(requestedModel.trim());
+  if (!m) return undefined;
+  const modelId = m[1]!;
+  const existing = db.prepare(
+    'SELECT id FROM models WHERE platform = ? AND model_id = ?'
+  ).get('chatgpt', modelId) as { id: number; enabled?: number } | undefined;
+  if (existing) {
+    // Re-enable if a prior row was disabled; pin requests should still work.
+    db.prepare('UPDATE models SET enabled = 1 WHERE id = ?').run(existing.id);
+    return { id: existing.id };
+  }
+  const result = db.prepare(`
+    INSERT INTO models
+      (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+       monthly_token_budget, context_window, enabled, supports_vision, supports_tools)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 1)
+  `).run(
+    'chatgpt', modelId, `${modelId} (ChatGPT)`, 1, 5, 'Frontier',
+    'ChatGPT subscription', 400000,
+  );
+  return { id: Number(result.lastInsertRowid) };
+}
+
 // Constant-time string comparison for the unified API key. Plain `===` leaks
 // length and per-character timing, which a network attacker could in principle
 // use to recover the key one byte at a time.
@@ -750,7 +783,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // loop sees nothing, which is strictly worse than an error. Same up-front
   // gate pattern as vision above.
   const wantsTools = (tools?.length ?? 0) > 0;
-  if (wantsTools && !hasEnabledToolsModel()) {
+  // A pinned ChatGPT (Codex plan) model is tool-capable by construction and is
+  // deliberately not in the fallback chain that hasEnabledToolsModel() counts,
+  // so exempt it from this cascade-only gate — the Claude Code fork always
+  // sends tools.
+  const pinsChatgpt = !!requestedModel && !isAutoModel(requestedModel) && /^(?:chatgpt\/)?gpt-/i.test(requestedModel.trim());
+  if (wantsTools && !pinsChatgpt && !hasEnabledToolsModel()) {
     res.status(422).json({
       error: {
         message: 'This request includes tools, but no tool-capable model is enabled. Enable a tool-calling model (e.g. GPT-OSS 120B, Gemini 3.5 Flash, GLM-4.7) in the Fallback Chain.',
@@ -809,6 +847,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     // Fallback: look up by model_id alone (backward compat for old clients).
     if (!enabled) {
       enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+    }
+    // ChatGPT (Codex plan): any model id matching /^gpt-/ selects the chatgpt
+    // provider. Auto-provision the catalog row on first use so an arbitrary
+    // gpt-* id resolves without a manual catalog edit. The row is created
+    // under platform 'chatgpt', which the router excludes from auto-routing —
+    // so it is reachable here (pinned) but never auto-selected.
+    if (!enabled) {
+      enabled = ensureChatgptModel(db, requestedModel);
     }
     if (enabled) {
       preferredModel = enabled.id;
@@ -1503,10 +1549,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         publish({ type: 'request.error', id: requestId, error: errorMsg, at: Date.now() });
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
-        res.status(502).json({
+        // The ChatGPT provider surfaces plan-level conditions with a precise
+        // client status (429 window-exhausted cooldown, 401 missing/expired
+        // Codex credentials) that must reach the client verbatim rather than
+        // being flattened to a generic 502. These are its only non-retryable
+        // status-bearing errors, so honoring err.status here is scoped to them.
+        const chatgptCode = err?.code === 'CHATGPT_COOLDOWN' || err?.code === 'CHATGPT_NO_CREDENTIALS';
+        const clientStatus = chatgptCode && typeof err?.status === 'number' ? err.status : 502;
+        res.status(clientStatus).json({
           error: {
             message: errorMsg,
-            type: 'provider_error',
+            type: clientStatus === 429 ? 'rate_limit_error' : clientStatus === 401 ? 'authentication_error' : 'provider_error',
           },
         });
         return;
