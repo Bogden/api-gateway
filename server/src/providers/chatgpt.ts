@@ -427,8 +427,17 @@ export class ChatGptProvider extends BaseProvider {
       }
     }
 
-    // Terminal chunk: finish_reason + usage, mirroring OpenAI's stream close.
-    yield mkChunk({}, sawToolCall ? 'tool_calls' : 'stop', usage);
+    // Terminal finish chunk, then a separate usage-only frame. OpenAI's
+    // streaming wire delivers usage in a trailing chunk with an EMPTY choices
+    // array (its `stream_options.include_usage` shape) — and the gateway proxy
+    // only harvests usage from such choice-less frames. Riding usage on the
+    // finish chunk (which carries a choice) makes the proxy silently drop it,
+    // so the client never sees token counts. Split them to match the shape the
+    // proxy expects.
+    yield mkChunk({}, sawToolCall ? 'tool_calls' : 'stop');
+    if (usage) {
+      yield { id, object: 'chat.completion.chunk', created, model: modelId, choices: [], usage };
+    }
   }
 
   // Parse the Responses SSE stream into typed event objects. The Responses API

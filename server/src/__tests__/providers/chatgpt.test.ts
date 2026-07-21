@@ -149,9 +149,13 @@ describe('ChatGptProvider', () => {
     expect(call.name).toBe('get_weather');
     expect(JSON.parse(call.args)).toEqual({ city: 'paris' });
 
+    // Usage rides a trailing choice-less frame (OpenAI include_usage shape);
+    // the finish_reason lives on the chunk just before it.
     const last = chunks[chunks.length - 1]!;
-    expect(last.choices[0]?.finish_reason).toBe('tool_calls');
+    expect(last.choices).toEqual([]);
     expect(last.usage).toEqual({ prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 });
+    const finishChunk = chunks[chunks.length - 2]!;
+    expect(finishChunk.choices[0]?.finish_reason).toBe('tool_calls');
   });
 
   it('extracts text + usage from a non-streaming completion', async () => {

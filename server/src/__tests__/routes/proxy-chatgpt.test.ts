@@ -34,6 +34,12 @@ function authHeaders() {
   return { Authorization: `Bearer ${getUnifiedApiKey()}` };
 }
 
+// The Anthropic wire format — used by the Claude Code fork routed through CC
+// Switch — sends the unified key in `x-api-key` rather than a bearer token.
+function xApiKeyHeaders() {
+  return { 'x-api-key': getUnifiedApiKey() };
+}
+
 function jwt(payload: Record<string, unknown>): string {
   const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
   return `${b64({ alg: 'none' })}.${b64(payload)}.sig`;
@@ -119,6 +125,31 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
       WHERE m.platform = 'chatgpt' AND fc.enabled = 1
     `).get() as { n: number };
     expect(inChain.n).toBe(0);
+  });
+
+  it('routes a gpt-* request authenticated via x-api-key (CC Switch / Anthropic wire) to the chatgpt provider', async () => {
+    mockCodex(() => ({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({
+        id: 'resp_xak',
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'pong' }] }],
+        usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 },
+      }),
+    }));
+
+    const res = await request(
+      app,
+      'POST',
+      '/v1/chat/completions',
+      { model: 'gpt-5-codex', messages: [{ role: 'user', content: 'ping' }], stream: false },
+      xApiKeyHeaders(),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers['x-routed-via']).toBe('chatgpt/gpt-5-codex');
+    expect(res.body.choices[0].message.content).toBe('pong');
   });
 
   it('returns a distinctive 429 and surfaces the cooldown on /api/health', async () => {
