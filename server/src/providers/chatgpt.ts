@@ -70,7 +70,7 @@ interface ResponsesRequestBody {
   parallel_tool_calls?: boolean;
   temperature?: number;
   top_p?: number;
-  max_output_tokens?: number;
+  // NB: no max_output_tokens — the subscription backend rejects it (card c1881).
   reasoning?: { effort?: string };
   // Subscription OAuth requires store:false; some OpenAI cache controls are
   // dropped under it, which we accept.
@@ -181,7 +181,14 @@ export class ChatGptProvider extends BaseProvider {
     if (options?.parallel_tool_calls != null) body.parallel_tool_calls = options.parallel_tool_calls;
     if (options?.temperature != null) body.temperature = options.temperature;
     if (options?.top_p != null) body.top_p = options.top_p;
-    if (options?.max_tokens != null) body.max_output_tokens = options.max_tokens;
+    // Deliberately DO NOT forward max_tokens as max_output_tokens. The ChatGPT
+    // subscription Responses backend (chatgpt.com/backend-api/codex/responses)
+    // rejects max_output_tokens with `400 Unsupported parameter`, so every
+    // harness-driven request (the Anthropic wire always sends a max-tokens
+    // field) failed. Prior art bman654/clodex (MIT) omits the field entirely on
+    // its OpenAI-OAuth subscription path for the same reason — an explicit
+    // max_output_tokens there yields a broken finish — so we strip it too. All
+    // other parameters are preserved. (card c1881)
 
     const effort = options?.reasoning_effort ?? options?.thinking?.effort;
     if (effort) body.reasoning = { effort: effort === 'xhigh' || effort === 'max' ? 'high' : effort };
@@ -278,7 +285,16 @@ export class ChatGptProvider extends BaseProvider {
       } catch {
         /* ignore */
       }
-      throw providerHttpError(res, `ChatGPT Responses API error ${res.status}: ${detail}`);
+      const err = providerHttpError(res, `ChatGPT Responses API error ${res.status}: ${detail}`);
+      // A deterministic client-side rejection (400 Bad Request / 422
+      // Unprocessable Entity) will fail identically on every retry — mark it
+      // non-retryable so the proxy fails fast and passes the upstream error
+      // through instead of burning the whole recovery budget (which turned a
+      // single 400 into "429 · Recovery limit reached after 6 attempts").
+      // 429/5xx are handled above / left retryable, so their behavior is
+      // unchanged. (card c1881)
+      if (res.status === 400 || res.status === 422) err.retryable = false;
+      throw err;
     }
     // A successful call clears any prior cooldown for this model.
     clearChatgptCooldown(body.model);

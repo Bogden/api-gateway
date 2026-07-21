@@ -497,6 +497,11 @@ const chatCompletionSchema = z.object({
   thinking: thinkingConfigSchema.nullable().optional(),
 });
 export function isRetryableError(err: any): boolean {
+  // Explicit provider opt-out: a deterministic upstream failure (e.g. a 400/422
+  // validation rejection) that will fail identically on every attempt. Honored
+  // before the message-based heuristics below so such errors fail fast and are
+  // passed through rather than consuming the recovery budget. (card c1881)
+  if (err?.retryable === false) return false;
   const msg = (err.message ?? '').toLowerCase();
   return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
     || msg.includes('quota') || msg.includes('resource_exhausted')

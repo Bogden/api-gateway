@@ -13,6 +13,14 @@ import type {
 export interface ProviderHttpError extends Error {
   status?: number;
   retryAfterMs?: number;
+  /** Explicit non-retryable marker. When a provider knows an upstream failure
+   *  is deterministic (e.g. a 400/422 validation rejection that will fail
+   *  identically on every attempt), it sets this to `false` so the proxy's
+   *  recovery loop fails fast and passes the upstream error through instead of
+   *  grinding the whole recovery budget. Leave undefined to let the proxy's
+   *  message-based classifier decide (the default). Never set `true` here to
+   *  force-retry — only `false` to opt out. */
+  retryable?: boolean;
 }
 
 /** Parse an HTTP `Retry-After` header (delta-seconds or an HTTP-date) into a

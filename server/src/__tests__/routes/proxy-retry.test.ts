@@ -51,6 +51,21 @@ describe('isRetryableError', () => {
     it('but a bare validation "400 Bad Request" (our own schema) is still NOT retryable', () => {
       expect(isRetryableError(new Error('400 Bad Request'))).toBe(false);
     });
+
+    // card c1881: a provider can explicitly opt an error out of retry when it
+    // knows the upstream failure is deterministic (e.g. ChatGPT subscription
+    // Responses 400/422). This wins even over the "api error 400" fail-over
+    // heuristic, so a deterministic 400 doesn't consume the recovery budget.
+    it('honors an explicit retryable:false marker even when the message would otherwise retry', () => {
+      const deterministic400 = Object.assign(
+        new Error('ChatGPT Responses API error 400: {"detail":"Unsupported parameter: max_output_tokens"}'),
+        { status: 400, retryable: false },
+      );
+      // Without the flag, this message matches "api error 400" and would retry.
+      expect(isRetryableError(new Error(deterministic400.message))).toBe(true);
+      // With the flag, it fails fast.
+      expect(isRetryableError(deterministic400)).toBe(false);
+    });
   });
 
   describe('403 model not on this key\'s tier is retryable (issue #256)', () => {

@@ -93,7 +93,14 @@ describe('ChatGptProvider', () => {
           { role: 'user', content: 'hi' },
         ],
         'gpt-5-codex',
-        { tools: [{ type: 'function', function: { name: 'shell', description: 'run', parameters: { type: 'object' } } }] },
+        {
+          // max_tokens MUST be stripped (the subscription backend 400s on
+          // max_output_tokens); temperature/top_p MUST survive. (card c1881)
+          max_tokens: 4096,
+          temperature: 0.4,
+          top_p: 0.9,
+          tools: [{ type: 'function', function: { name: 'shell', description: 'run', parameters: { type: 'object' } } }],
+        },
       ),
     );
 
@@ -110,6 +117,61 @@ describe('ChatGptProvider', () => {
     expect(capturedBody.tools).toEqual([
       { type: 'function', name: 'shell', description: 'run', parameters: { type: 'object' } },
     ]);
+    // The failing shape from card c1881: the max-tokens field must not reach the
+    // Responses upstream in any form, while other tuning params are preserved.
+    expect(capturedBody.max_output_tokens).toBeUndefined();
+    expect(capturedBody.max_tokens).toBeUndefined();
+    expect(capturedBody.temperature).toBe(0.4);
+    expect(capturedBody.top_p).toBe(0.9);
+  });
+
+  it('fails fast on a deterministic 400 (marked non-retryable, upstream error passed through)', async () => {
+    writeLogin();
+    const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({
+      ok: false,
+      status: 400,
+      headers: new Headers(),
+      text: async () => '{"detail":"Unsupported parameter: max_output_tokens"}',
+    } as any);
+
+    let err: any;
+    try {
+      await collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5-codex'));
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    // The proxy's recovery loop honors this flag to fail fast instead of
+    // grinding the whole retry budget on a deterministic client error.
+    expect(err.retryable).toBe(false);
+    expect(err.status).toBe(400);
+    // The upstream detail is passed through to the caller.
+    expect(err.message).toMatch(/Unsupported parameter: max_output_tokens/);
+    // No retry attempted at the provider seam.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks a 422 non-retryable too, but leaves 5xx retryable', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: false, status: 422, headers: new Headers(), text: async () => 'unprocessable',
+    } as any);
+    let err422: any;
+    try {
+      await collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5-codex'));
+    } catch (e) { err422 = e; }
+    expect(err422.retryable).toBe(false);
+
+    // A 500 stays retryable (retryable flag left undefined → proxy decides).
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: false, status: 500, headers: new Headers(), text: async () => 'boom',
+    } as any);
+    let err500: any;
+    try {
+      await collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5'));
+    } catch (e) { err500 = e; }
+    expect(err500.retryable).toBeUndefined();
+    expect(err500.status).toBe(500);
   });
 
   it('streams a happy-path turn with a tool call and extracts usage', async () => {
