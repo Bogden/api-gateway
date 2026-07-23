@@ -20,6 +20,10 @@ import {
   clearChatgptCooldown,
   getChatgptCooldown,
 } from '../services/chatgpt-cooldown.js';
+import {
+  recordChatgptUsageFromHeaders,
+  getChatgptCooldownHintMs,
+} from '../services/chatgpt-usage.js';
 
 // ────────────────────────────────────────────────────────────────────────────
 // ChatGPT subscription provider.
@@ -54,6 +58,11 @@ const CODEX_RESPONSES_BASE = 'https://chatgpt.com/backend-api/codex';
 // not per-minute — so when the backend gives no explicit Retry-After we bench
 // the model for a conservative default rather than probing every few seconds.
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
+
+// When a 429 carries no Retry-After, a recent plan-usage snapshot's primary
+// window reset is a better cooldown estimate than the flat default — but only
+// while it's fresh enough to still describe the live window.
+const USAGE_SNAPSHOT_MAX_AGE_MS = 30 * 60 * 1000;
 
 // The Codex backend rejects requests without a mandatory `instructions` field;
 // use a minimal default when the client sent no system message.
@@ -237,13 +246,18 @@ export class ChatGptProvider extends BaseProvider {
 
   // Arm a cooldown from a 429 response and return the distinctive error.
   private handle429(modelId: string, res: Response): ProviderHttpError {
-    const retryAfterMs = parseRetryAfterMs(res.headers?.get('retry-after')) ?? DEFAULT_COOLDOWN_MS;
+    // Prefer an explicit Retry-After. Absent that, fall back to the last plan-
+    // usage snapshot's primary reset time (when it's fresh and still in the
+    // future) before the flat default — it reflects the real window boundary.
+    const retryAfterMs = parseRetryAfterMs(res.headers?.get('retry-after'));
+    const cooldownMs =
+      retryAfterMs ?? getChatgptCooldownHintMs(USAGE_SNAPSHOT_MAX_AGE_MS) ?? DEFAULT_COOLDOWN_MS;
     // Deliberately digit-free: the proxy's retry classifier treats "429" (and
     // "rate limit", "quota", …) as retryable, which would drive the plan into
     // the 1-RPM recovery loop and hammer it. This cooldown must be terminal.
     const reason = 'Backend signalled the subscription usage window is exhausted.';
-    setChatgptCooldown(modelId, retryAfterMs, reason);
-    return this.cooldownError(modelId, reason, retryAfterMs);
+    setChatgptCooldown(modelId, cooldownMs, reason);
+    return this.cooldownError(modelId, reason, cooldownMs);
   }
 
   // POST to the Responses endpoint, refreshing the token once on a 401 (the
@@ -296,6 +310,10 @@ export class ChatGptProvider extends BaseProvider {
       if (res.status === 400 || res.status === 422) err.retryable = false;
       throw err;
     }
+    // Capture the plan-usage snapshot the backend reports on every response via
+    // `x-codex-*` headers (card c2054). Best-effort — never fails a request.
+    // Reading headers does not consume the (still-unread) streaming body.
+    recordChatgptUsageFromHeaders(res.headers);
     // A successful call clears any prior cooldown for this model.
     clearChatgptCooldown(body.model);
     return res;

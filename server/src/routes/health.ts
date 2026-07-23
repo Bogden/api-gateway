@@ -4,6 +4,7 @@ import { getDb } from '../db/index.js';
 import { checkKeyHealth, checkAllKeys } from '../services/health.js';
 import { hasProvider } from '../providers/index.js';
 import { getActiveChatgptCooldowns } from '../services/chatgpt-cooldown.js';
+import { getChatgptUsageSnapshots } from '../services/chatgpt-usage.js';
 
 export const healthRouter = Router();
 
@@ -57,6 +58,16 @@ healthRouter.get('/', (_req: Request, res: Response) => {
     // status/analytics tooling to show the plan is throttled (never a silent
     // fallback to another provider). Empty array when nothing is cooling down.
     chatgptCooldowns: getActiveChatgptCooldowns(),
+    // ChatGPT (Codex plan) numeric plan-usage snapshot, parsed from the
+    // upstream Responses backend's `x-codex-*` response headers on each request
+    // (see services/chatgpt-usage.ts). Each entry:
+    //   { limitId, primary: { usedPercent, windowMinutes, resetsAt } | null,
+    //     secondary: { … } | null, receivedAt (ISO-8601) }
+    // where resetsAt is the upstream epoch-SECONDS reset time and receivedAt
+    // lets consumers judge staleness. Documented contract consumed by the
+    // chain-console third-pool usage meter (epic c2053 child B). Empty array
+    // until the first ChatGPT request populates it (resets on restart).
+    chatgptUsage: getChatgptUsageSnapshots(),
   });
 });
 

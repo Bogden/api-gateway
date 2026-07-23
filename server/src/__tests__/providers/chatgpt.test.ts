@@ -9,6 +9,10 @@ import {
   getActiveChatgptCooldowns,
   _resetChatgptCooldowns,
 } from '../../services/chatgpt-cooldown.js';
+import {
+  getChatgptUsageSnapshots,
+  _resetChatgptUsage,
+} from '../../services/chatgpt-usage.js';
 import type { ChatCompletionChunk } from '@api-gateway/shared/types.js';
 
 function jwt(payload: Record<string, unknown>): string {
@@ -40,6 +44,20 @@ function sseResponse(frames: string[]): any {
   return { ok: true, status: 200, headers: new Headers(), body: stream };
 }
 
+// The `x-codex-*` plan-usage headers the backend returns on every response.
+function usageHeaders(overrides: Record<string, string> = {}): Headers {
+  return new Headers({
+    'x-codex-active-limit': 'premium',
+    'x-codex-primary-used-percent': '7',
+    'x-codex-primary-window-minutes': '10080',
+    'x-codex-primary-reset-at': '1785375709',
+    'x-codex-secondary-used-percent': '0',
+    'x-codex-secondary-window-minutes': '0',
+    'x-codex-secondary-reset-at': '',
+    ...overrides,
+  });
+}
+
 async function collect(gen: AsyncGenerator<ChatCompletionChunk>): Promise<ChatCompletionChunk[]> {
   const out: ChatCompletionChunk[] = [];
   for await (const c of gen) out.push(c);
@@ -54,6 +72,7 @@ describe('ChatGptProvider', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     _resetChatgptCooldowns();
+    _resetChatgptUsage();
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-prov-'));
     process.env.CODEX_HOME = home;
     provider = new ChatGptProvider();
@@ -281,5 +300,109 @@ describe('ChatGptProvider', () => {
       collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'again' }], 'gpt-5-codex')),
     ).rejects.toThrow(/usage window exhausted/i);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('captures the plan-usage snapshot from response headers on a streaming turn', async () => {
+    writeLogin();
+    const res = sseResponse([
+      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
+    ]);
+    res.headers = usageHeaders({ 'x-codex-primary-used-percent': '42' });
+    vi.spyOn(global, 'fetch').mockResolvedValue(res as any);
+
+    await collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5'));
+
+    const snaps = getChatgptUsageSnapshots();
+    expect(snaps).toHaveLength(1);
+    expect(snaps[0]!.limitId).toBe('premium');
+    expect(snaps[0]!.primary).toEqual({ usedPercent: 42, windowMinutes: 10080, resetsAt: 1785375709 });
+    expect(snaps[0]!.secondary).toBeNull();
+  });
+
+  it('captures the plan-usage snapshot from response headers on a non-streaming turn', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: usageHeaders({ 'x-codex-primary-used-percent': '55' }),
+      json: async () => ({
+        id: 'resp_1',
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }],
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      }),
+    } as any);
+
+    await provider.chatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5');
+    const snaps = getChatgptUsageSnapshots();
+    expect(snaps).toHaveLength(1);
+    expect(snaps[0]!.primary!.usedPercent).toBe(55);
+  });
+
+  it('never fails a request when usage headers are absent (older/changed upstream)', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValue(
+      sseResponse([
+        'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+      ]) as any,
+    );
+    const chunks = await collect(
+      provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5'),
+    );
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(getChatgptUsageSnapshots()).toHaveLength(0);
+  });
+
+  it('prefers the fresh snapshot resets_at over the 5-min default when a 429 has no Retry-After', async () => {
+    writeLogin();
+    const resetSec = Math.floor(Date.now() / 1000) + 20 * 60; // window resets in ~20 min
+
+    // First: a successful turn that seeds a fresh usage snapshot.
+    const ok = sseResponse([
+      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+    ]);
+    ok.headers = usageHeaders({ 'x-codex-primary-reset-at': String(resetSec) });
+    const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValueOnce(ok as any);
+    await collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5-codex'));
+
+    // Then: a 429 with NO Retry-After. Cooldown should track the snapshot's
+    // resets_at (~20 min), well beyond the flat 5-minute default.
+    fetchSpy.mockResolvedValueOnce({
+      ok: false, status: 429, headers: new Headers(), text: async () => 'rate limited',
+    } as any);
+    let err: any;
+    try {
+      await collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'again' }], 'gpt-5-codex'));
+    } catch (e) { err = e; }
+    expect(err.code).toBe('CHATGPT_COOLDOWN');
+
+    const active = getActiveChatgptCooldowns();
+    expect(active).toHaveLength(1);
+    // Comfortably longer than the 5-minute default → snapshot preference took effect.
+    expect(active[0]!.remainingMs).toBeGreaterThan(10 * 60 * 1000);
+  });
+
+  it('keeps the 5-min default on a 429 with no Retry-After when the snapshot reset is stale/past', async () => {
+    writeLogin();
+    const pastSec = Math.floor(Date.now() / 1000) - 60; // already reset
+
+    const ok = sseResponse([
+      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+    ]);
+    ok.headers = usageHeaders({ 'x-codex-primary-reset-at': String(pastSec) });
+    const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValueOnce(ok as any);
+    await collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5-codex'));
+
+    fetchSpy.mockResolvedValueOnce({
+      ok: false, status: 429, headers: new Headers(), text: async () => 'rate limited',
+    } as any);
+    try {
+      await collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'again' }], 'gpt-5-codex'));
+    } catch { /* expected */ }
+
+    const active = getActiveChatgptCooldowns();
+    expect(active).toHaveLength(1);
+    // Falls back to the flat 5-minute default (≤ 5 min remaining).
+    expect(active[0]!.remainingMs).toBeLessThanOrEqual(5 * 60 * 1000);
+    expect(active[0]!.remainingMs).toBeGreaterThan(4 * 60 * 1000);
   });
 });
