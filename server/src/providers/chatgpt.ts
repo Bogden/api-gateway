@@ -15,6 +15,7 @@ import {
   type ProviderHttpError,
 } from './base.js';
 import { contentToString } from '../lib/content.js';
+import { compressBlob } from './blobCompress.js';
 import { getCodexCredential, CodexCredentialsError } from '../lib/codex-auth.js';
 import {
   setChatgptCooldown,
@@ -130,6 +131,13 @@ export class ChatGptProvider extends BaseProvider {
   ): ResponsesRequestBody {
     const systemParts: string[] = [];
     const input: ResponsesInputItem[] = [];
+    // Kill switch (card c2081): a hot-path transform on a subscription window
+    // deserves a no-deploy off switch. Enabled by default.
+    const compressionEnabled =
+      process.env.CHATGPT_BLOB_COMPRESSION !== '0' && process.env.CHATGPT_BLOB_COMPRESSION !== 'false';
+    let blobsCompressed = 0;
+    let charsBefore = 0;
+    let charsAfter = 0;
 
     for (const m of messages) {
       if (m.role === 'system') {
@@ -138,10 +146,17 @@ export class ChatGptProvider extends BaseProvider {
         continue;
       }
       if (m.role === 'tool') {
+        const raw = contentToString(m.content ?? '');
+        const output = compressionEnabled ? compressBlob(raw) : raw;
+        if (output.length !== raw.length) {
+          blobsCompressed++;
+          charsBefore += raw.length;
+          charsAfter += output.length;
+        }
         input.push({
           type: 'function_call_output',
           call_id: m.tool_call_id ?? '',
-          output: contentToString(m.content ?? ''),
+          output,
         });
         continue;
       }
@@ -205,6 +220,12 @@ export class ChatGptProvider extends BaseProvider {
 
     const effort = options?.reasoning_effort ?? options?.thinking?.effort;
     if (effort) body.reasoning = { effort: effort === 'xhigh' || effort === 'max' ? 'high' : effort };
+
+    if (blobsCompressed > 0) {
+      console.log(
+        `[chatgpt] compressed ${blobsCompressed} tool-result blob(s): ${charsBefore} → ${charsAfter} chars`,
+      );
+    }
 
     return body;
   }

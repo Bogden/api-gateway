@@ -463,4 +463,83 @@ describe('ChatGptProvider', () => {
     expect(active[0]!.remainingMs).toBeLessThanOrEqual(5 * 60 * 1000);
     expect(active[0]!.remainingMs).toBeGreaterThan(4 * 60 * 1000);
   });
+
+  describe('tool-result blob compression (card c2081)', () => {
+    const origCompressionEnv = process.env.CHATGPT_BLOB_COMPRESSION;
+
+    afterEach(() => {
+      if (origCompressionEnv === undefined) delete process.env.CHATGPT_BLOB_COMPRESSION;
+      else process.env.CHATGPT_BLOB_COMPRESSION = origCompressionEnv;
+    });
+
+    function bigToolBlob(): string {
+      const lines = Array.from({ length: 40 }, (_, i) => `line number ${i} of tool output`);
+      return JSON.stringify({ ok: true, lines }, null, 2);
+    }
+
+    it('minifies a large pretty-JSON function_call_output while leaving function_call.arguments, call_ids, and item order untouched', async () => {
+      writeLogin();
+      delete process.env.CHATGPT_BLOB_COMPRESSION;
+      let capturedBody: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+        capturedBody = JSON.parse((init as any).body);
+        return sseResponse([
+          'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
+        ]);
+      });
+
+      const blob = bigToolBlob();
+      const args = '{\n  "path":   "/x/y.txt"\n}';
+      await collect(
+        provider.streamChatCompletion(
+          'no-key',
+          [
+            { role: 'user', content: 'read the file' },
+            {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: args } }],
+            } as any,
+            { role: 'tool', tool_call_id: 'call_1', content: blob },
+          ],
+          'gpt-5-codex',
+        ),
+      );
+
+      expect(capturedBody.input).toHaveLength(3);
+      const [userItem, fnCallItem, fnOutputItem] = capturedBody.input;
+      expect(userItem.type).toBe('message');
+      expect(fnCallItem.type).toBe('function_call');
+      expect(fnCallItem.call_id).toBe('call_1');
+      // Model-generated arguments must survive byte-for-byte, whitespace and all.
+      expect(fnCallItem.arguments).toBe(args);
+      expect(fnOutputItem.type).toBe('function_call_output');
+      expect(fnOutputItem.call_id).toBe('call_1');
+      expect(fnOutputItem.output.length).toBeLessThan(blob.length);
+      expect(JSON.parse(fnOutputItem.output)).toEqual(JSON.parse(blob));
+    });
+
+    it('passes the blob through unchanged when the kill switch is set to 0', async () => {
+      writeLogin();
+      process.env.CHATGPT_BLOB_COMPRESSION = '0';
+      let capturedBody: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+        capturedBody = JSON.parse((init as any).body);
+        return sseResponse([
+          'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
+        ]);
+      });
+
+      const blob = bigToolBlob();
+      await collect(
+        provider.streamChatCompletion(
+          'no-key',
+          [{ role: 'tool', tool_call_id: 'call_1', content: blob }],
+          'gpt-5-codex',
+        ),
+      );
+
+      expect(capturedBody.input[0].output).toBe(blob);
+    });
+  });
 });
