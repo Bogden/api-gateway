@@ -304,6 +304,7 @@ export interface TokenUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  cache_read_input_tokens?: number;
 }
 
 export interface ChatCompletionResponse {

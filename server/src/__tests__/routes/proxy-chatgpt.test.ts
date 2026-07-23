@@ -7,6 +7,8 @@ import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 import { _resetChatgptCooldowns } from '../../services/chatgpt-cooldown.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
+import { setClaudeModelMap } from '../../services/anthropic-map.js';
+import { ensureChatgptModel } from '../../routes/proxy.js';
 
 let dashToken = '';
 
@@ -83,15 +85,28 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
     // Register the keyless chatgpt provider (sentinel key, no key material).
     const add = await request(app, 'POST', '/api/keys', { platform: 'chatgpt', label: 'codex' });
     expect(add.status).toBe(201);
+    ensureChatgptModel(db, 'gpt-5-codex');
+    setClaudeModelMap({ default: 'gpt-5-codex' });
   });
 
-  function mockCodex(handler: () => any) {
+  function mockCodex(handler: (init?: RequestInit) => any) {
     const origFetch = global.fetch;
     vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
       const s = typeof url === 'string' ? url : url.toString();
-      if (s === CODEX_URL) return handler();
+      if (s === CODEX_URL) return handler(init);
       return origFetch(url as any, init as any);
     });
+  }
+
+  function sseResponse(frames: string[]): Response {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const enc = new TextEncoder();
+        for (const frame of frames) controller.enqueue(enc.encode(frame));
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
   }
 
   it('routes a gpt-* request to the chatgpt provider and returns the completion', async () => {
@@ -127,7 +142,7 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
     expect(inChain.n).toBe(0);
   });
 
-  it('routes a gpt-* request authenticated via x-api-key (CC Switch / Anthropic wire) to the chatgpt provider', async () => {
+  it('maps cached input usage on a non-streaming Anthropic response', async () => {
     mockCodex(() => ({
       ok: true,
       status: 200,
@@ -135,21 +150,62 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
       json: async () => ({
         id: 'resp_xak',
         output: [{ type: 'message', content: [{ type: 'output_text', text: 'pong' }] }],
-        usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 },
+        usage: {
+          input_tokens: 10,
+          input_tokens_details: { cached_tokens: 6 },
+          output_tokens: 1,
+          total_tokens: 11,
+        },
       }),
     }));
 
     const res = await request(
       app,
       'POST',
-      '/v1/chat/completions',
-      { model: 'gpt-5-codex', messages: [{ role: 'user', content: 'ping' }], stream: false },
+      '/v1/messages',
+      { model: 'gpt-5-codex', max_tokens: 100, messages: [{ role: 'user', content: 'ping' }], stream: false },
       xApiKeyHeaders(),
     );
 
     expect(res.status).toBe(200);
     expect(res.headers['x-routed-via']).toBe('chatgpt/gpt-5-codex');
-    expect(res.body.choices[0].message.content).toBe('pong');
+    expect(res.body.content).toEqual([{ type: 'text', text: 'pong' }]);
+    expect(res.body.usage).toEqual({ input_tokens: 4, output_tokens: 1, cache_read_input_tokens: 6 });
+    const logged = getDb().prepare(`
+      SELECT input_tokens, output_tokens, cache_read_input_tokens
+      FROM requests ORDER BY id DESC LIMIT 1
+    `).get() as any;
+    expect(logged).toEqual({ input_tokens: 4, output_tokens: 1, cache_read_input_tokens: 6 });
+  });
+
+  it('maps cached input usage on a streaming Anthropic response', async () => {
+    mockCodex(() => sseResponse([
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"pong"}\n\n',
+      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":6},"output_tokens":1,"total_tokens":11}}}\n\n',
+    ]));
+
+    const res = await request(
+      app,
+      'POST',
+      '/v1/messages',
+      { model: 'gpt-5-codex', max_tokens: 100, messages: [{ role: 'user', content: 'ping' }], stream: true },
+      xApiKeyHeaders(),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers['x-routed-via']).toBe('chatgpt/gpt-5-codex');
+    const events = res.text
+      .split('\n\n')
+      .map(frame => frame.split('\n').find(line => line.startsWith('data: '))?.slice(6))
+      .filter(Boolean)
+      .map(data => JSON.parse(data!));
+    const delta = events.find(evt => evt.type === 'message_delta');
+    expect(delta.usage).toEqual({ input_tokens: 4, output_tokens: 1, cache_read_input_tokens: 6 });
+    const logged = getDb().prepare(`
+      SELECT input_tokens, output_tokens, cache_read_input_tokens
+      FROM requests ORDER BY id DESC LIMIT 1
+    `).get() as any;
+    expect(logged).toEqual({ input_tokens: 4, output_tokens: 1, cache_read_input_tokens: 6 });
   });
 
   it('returns a distinctive 429 and surfaces the cooldown on /api/health', async () => {

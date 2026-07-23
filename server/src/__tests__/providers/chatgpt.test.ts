@@ -144,6 +144,49 @@ describe('ChatGptProvider', () => {
     expect(capturedBody.top_p).toBe(0.9);
   });
 
+  it('uses the stable system-and-tools prefix for the prompt cache key', async () => {
+    writeLogin();
+    const bodies: any[] = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      bodies.push(JSON.parse((init as any).body));
+      return sseResponse([
+        'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
+      ]);
+    });
+
+    const tools = [{ type: 'function' as const, function: { name: 'shell', description: 'run', parameters: { type: 'object' } } }];
+    await collect(provider.streamChatCompletion(
+      'no-key',
+      [{ role: 'system', content: 'be terse' }, { role: 'user', content: 'first turn' }],
+      'gpt-5-codex',
+      { tools },
+    ));
+    await collect(provider.streamChatCompletion(
+      'no-key',
+      [
+        { role: 'system', content: 'be terse' },
+        { role: 'user', content: 'first turn' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'second turn' },
+      ],
+      'gpt-5-codex',
+      { tools },
+    ));
+    await collect(provider.streamChatCompletion(
+      'no-key',
+      [{ role: 'system', content: 'be expansive' }, { role: 'user', content: 'first turn' }],
+      'gpt-5-codex',
+      { tools },
+    ));
+
+    expect(bodies).toHaveLength(3);
+    expect(bodies[0].prompt_cache_key).toMatch(/^[a-f0-9]{64}$/);
+    expect(bodies[1].prompt_cache_key).toBe(bodies[0].prompt_cache_key);
+    expect(bodies[2].prompt_cache_key).not.toBe(bodies[0].prompt_cache_key);
+    expect(bodies[0].prompt_cache_retention).toBeUndefined();
+    expect(bodies[0].previous_response_id).toBeUndefined();
+  });
+
   it('fails fast on a deterministic 400 (marked non-retryable, upstream error passed through)', async () => {
     writeLogin();
     const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({
@@ -201,7 +244,7 @@ describe('ChatGptProvider', () => {
         'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"get_weather"}}\n\n',
         'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\\"city\\":"}\n\n',
         'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"\\"paris\\"}"}\n\n',
-        'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":7,"total_tokens":19}}}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":8},"output_tokens":7,"total_tokens":19}}}\n\n',
       ]) as any,
     );
 
@@ -234,7 +277,12 @@ describe('ChatGptProvider', () => {
     // the finish_reason lives on the chunk just before it.
     const last = chunks[chunks.length - 1]!;
     expect(last.choices).toEqual([]);
-    expect(last.usage).toEqual({ prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 });
+    expect(last.usage).toEqual({
+      prompt_tokens: 4,
+      completion_tokens: 7,
+      total_tokens: 19,
+      cache_read_input_tokens: 8,
+    });
     const finishChunk = chunks[chunks.length - 2]!;
     expect(finishChunk.choices[0]?.finish_reason).toBe('tool_calls');
   });
@@ -248,13 +296,23 @@ describe('ChatGptProvider', () => {
       json: async () => ({
         id: 'resp_1',
         output: [{ type: 'message', content: [{ type: 'output_text', text: 'hello world' }] }],
-        usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+        usage: {
+          input_tokens: 5,
+          input_tokens_details: { cached_tokens: 3 },
+          output_tokens: 2,
+          total_tokens: 7,
+        },
       }),
     } as any);
 
     const res = await provider.chatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5');
     expect(res.choices[0]?.message.content).toBe('hello world');
-    expect(res.usage).toEqual({ prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 });
+    expect(res.usage).toEqual({
+      prompt_tokens: 2,
+      completion_tokens: 2,
+      total_tokens: 7,
+      cache_read_input_tokens: 3,
+    });
     expect(res._routed_via?.platform).toBe('chatgpt');
   });
 

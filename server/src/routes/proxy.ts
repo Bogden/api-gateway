@@ -1365,13 +1365,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.write('data: [DONE]\n\n');
           res.end();
 
+          const streamedUsage = (usageChunk as any)?.usage;
+          const inputTokens = streamedUsage?.prompt_tokens ?? estimatedInputTokens + injectedHandoffTokens;
+          const outputTokens = streamedUsage?.completion_tokens ?? totalOutputTokens;
+          const cacheReadInputTokens = streamedUsage?.cache_read_input_tokens ?? 0;
           recordRequest(route.platform, route.modelId, route.keyId);
-          recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + injectedHandoffTokens + totalOutputTokens);
+          recordTokens(route.platform, route.modelId, route.keyId, streamedUsage?.total_tokens ?? inputTokens + cacheReadInputTokens + outputTokens);
           recordSuccess(route.modelDbId);
           setStickyModel(extractApiToken(req), messages, route.modelDbId, sessionIdHeader);
           if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
-          publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: estimatedInputTokens + injectedHandoffTokens, out: totalOutputTokens }, at: Date.now() });
+          logRequest(route.platform, route.modelId, route.keyId, 'success', inputTokens, outputTokens, Date.now() - start, null, ttfbMs, pinnedModelId, cacheReadInputTokens);
+          publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: inputTokens, out: outputTokens, cacheRead: cacheReadInputTokens }, at: Date.now() });
           clearExhausted(route.keyId, route.modelId);
           if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
           return;
@@ -1487,8 +1491,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           result.usage?.prompt_tokens ?? 0,
           result.usage?.completion_tokens ?? 0,
           Date.now() - start, null, null, pinnedModelId,
+          result.usage?.cache_read_input_tokens ?? 0,
         );
-        publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: result.usage?.prompt_tokens ?? 0, out: result.usage?.completion_tokens ?? 0 }, at: Date.now() });
+        publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: result.usage?.prompt_tokens ?? 0, out: result.usage?.completion_tokens ?? 0, cacheRead: result.usage?.cache_read_input_tokens ?? 0 }, at: Date.now() });
         clearExhausted(route.keyId, route.modelId);
         if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
         return;
@@ -1634,13 +1639,14 @@ export function logRequest(
   // analytics split pinned vs auto traffic and detect failover overrides
   // (requested_model set but != model_id).
   requestedModel: string | null = null,
+  cacheReadInputTokens = 0,
 ) {
   try {
     const db = getDb();
     db.prepare(`
-      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel);
+      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model, cache_read_input_tokens)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel, cacheReadInputTokens);
   } catch (e) {
     console.error('Failed to log request:', e);
   }

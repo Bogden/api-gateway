@@ -14,7 +14,7 @@ interface LiveEventBase {
 }
 
 interface RequestStartEvent extends LiveEventBase { type: 'request.start'; model?: string; stream: boolean; }
-interface RequestDoneEvent extends LiveEventBase { type: 'request.done'; model: string; provider: string; keyId: number; latencyMs: number; tokens?: { in: number; out: number }; }
+interface RequestDoneEvent extends LiveEventBase { type: 'request.done'; model: string; provider: string; keyId: number; latencyMs: number; tokens?: { in: number; out: number; cacheRead?: number }; }
 interface RequestErrorEvent extends LiveEventBase { type: 'request.error'; error: string; }
 // Client-disconnect signal (Stop button, socket close, session reset).
 // Emitted in three places in proxy.ts plus three in responses.ts — every
@@ -74,7 +74,7 @@ function formatEvent(evt: LiveEvent): LogEntry | undefined {
     case 'request.start':
       return { id: e.id, ts, kind: 'start', text: `▶ [${rId}] Request started${e.model ? ` (pinned: ${e.model})` : ' (auto)'} — ${e.stream ? 'streaming' : 'non-stream'}` };
     case 'request.done':
-      return { id: e.id, ts, kind: 'done', text: `✓ [${rId}] ${e.provider}/${e.model} key#${e.keyId} — ${e.latencyMs}ms${e.tokens ? `, ${e.tokens.in}↓/${e.tokens.out}↑ tokens` : ''}` };
+      return { id: e.id, ts, kind: 'done', text: `✓ [${rId}] ${e.provider}/${e.model} key#${e.keyId} — ${e.latencyMs}ms${e.tokens ? `, ${e.tokens.in}↓/${e.tokens.out}↑ tokens${e.tokens.cacheRead ? `, ${e.tokens.cacheRead} cache-read` : ''}` : ''}` };
     case 'request.error':
       return { id: e.id, ts, kind: 'error', text: `✗ [${rId}] ${e.error}` };
     case 'request.aborted':

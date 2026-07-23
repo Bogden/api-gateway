@@ -104,7 +104,7 @@ interface AnthropicMessageResponse {
   content: AnthropicResponseBlock[];
   stop_reason: AnthropicStopReason;
   stop_sequence: string | null;
-  usage: { input_tokens: number; output_tokens: number };
+  usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number };
 }
 
 // Carries an HTTP status + Anthropic error type through the routing loop.
@@ -433,10 +433,11 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       }
 
       const promptTokens = result.usage?.prompt_tokens ?? estimatedInputTokens;
+      const cacheReadInputTokens = result.usage?.cache_read_input_tokens ?? 0;
       const completionTokens = result.usage?.completion_tokens ?? Math.ceil((respText.length + respToolCalls.reduce((n, c) => n + c.function.arguments.length, 0)) / 4);
 
       recordRequest(route.platform, route.modelId, route.keyId);
-      recordTokens(route.platform, route.modelId, route.keyId, result.usage?.total_tokens ?? promptTokens + completionTokens);
+      recordTokens(route.platform, route.modelId, route.keyId, result.usage?.total_tokens ?? promptTokens + cacheReadInputTokens + completionTokens);
       recordSuccess(route.modelDbId);
       // Remember this model for the rest of the auto-routed session (no-op for
       // a pinned request — the pin already fixes the model).
@@ -450,12 +451,16 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
         content: toAnthropicContent(respMsg),
         stop_reason: mapStopReason(result.choices?.[0]?.finish_reason ?? null, respToolCalls.length > 0),
         stop_sequence: null,
-        usage: { input_tokens: promptTokens, output_tokens: completionTokens },
+        usage: {
+          input_tokens: promptTokens,
+          output_tokens: completionTokens,
+          ...(cacheReadInputTokens > 0 ? { cache_read_input_tokens: cacheReadInputTokens } : {}),
+        },
       };
 
       res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
       if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
-      logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId);
+      logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId, cacheReadInputTokens);
       res.json(anthropicResponse);
       return;
     } catch (err: any) {
@@ -523,6 +528,7 @@ async function streamCompletion(
   let nextIndex = 0;
   let outputChars = 0;
   let upstreamFinish: string | null = null;
+  let finalUsage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number } | undefined;
   const toolAcc = new Map<number, { id?: string; name: string; args: string }>();
 
   const ensureMessageStart = () => {
@@ -559,6 +565,16 @@ async function streamCompletion(
         res.end();
         logRequest(route.platform, route.modelId, route.keyId, 'error', ctx.estimatedInputTokens, outputChars, Date.now() - ctx.start, `in-band error frame: ${sanitizeProviderErrorMessage(String(msg))}`, null, ctx.pinnedModelId);
         throw new StreamAlreadyStarted();
+      }
+
+      if (anyChunk.usage) {
+        finalUsage = {
+          input_tokens: anyChunk.usage.prompt_tokens ?? ctx.estimatedInputTokens,
+          output_tokens: anyChunk.usage.completion_tokens ?? Math.ceil(outputChars / 4),
+          ...(anyChunk.usage.cache_read_input_tokens != null
+            ? { cache_read_input_tokens: anyChunk.usage.cache_read_input_tokens }
+            : {}),
+        };
       }
 
       const choice = anyChunk.choices?.[0];
@@ -618,16 +634,26 @@ async function streamCompletion(
     }
 
     const stopReason = mapStopReason(upstreamFinish, completedCalls.length > 0);
-    const outputTokens = Math.ceil(outputChars / 4);
-    writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } });
+    const outputTokens = finalUsage?.output_tokens ?? Math.ceil(outputChars / 4);
+    const inputTokens = finalUsage?.input_tokens ?? ctx.estimatedInputTokens;
+    const cacheReadInputTokens = finalUsage?.cache_read_input_tokens ?? 0;
+    writeSse(res, 'message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        ...(cacheReadInputTokens > 0 ? { cache_read_input_tokens: cacheReadInputTokens } : {}),
+      },
+    });
     writeSse(res, 'message_stop', { type: 'message_stop' });
     res.end();
 
     recordRequest(route.platform, route.modelId, route.keyId);
-    recordTokens(route.platform, route.modelId, route.keyId, ctx.estimatedInputTokens + outputTokens);
+    recordTokens(route.platform, route.modelId, route.keyId, inputTokens + cacheReadInputTokens + outputTokens);
     recordSuccess(route.modelDbId);
     if (!ctx.pinned) setStickyModel(ctx.apiKey, messages, route.modelDbId, ctx.sessionId);
-    logRequest(route.platform, route.modelId, route.keyId, 'success', ctx.estimatedInputTokens, outputTokens, Date.now() - ctx.start, null, null, ctx.pinnedModelId);
+    logRequest(route.platform, route.modelId, route.keyId, 'success', inputTokens, outputTokens, Date.now() - ctx.start, null, null, ctx.pinnedModelId, cacheReadInputTokens);
   } catch (err: any) {
     if (err instanceof StreamAlreadyStarted) throw err;
     if (messageStarted) {

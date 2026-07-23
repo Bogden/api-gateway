@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import type {
   ChatMessage,
   ChatCompletionResponse,
@@ -73,6 +74,7 @@ const STREAM_INACTIVITY_TIMEOUT_MS = 300_000;
 interface ResponsesRequestBody {
   model: string;
   instructions: string;
+  prompt_cache_key: string;
   input: ResponsesInputItem[];
   tools?: Array<{ type: 'function'; name: string; description?: string; parameters?: Record<string, unknown>; strict?: boolean }>;
   tool_choice?: unknown;
@@ -166,26 +168,28 @@ export class ChatGptProvider extends BaseProvider {
       });
     }
 
+    const instructions = systemParts.join('\n\n') || DEFAULT_INSTRUCTIONS;
+    const tools = options?.tools
+      ?.filter((t) => t.type === 'function' && t.function?.name)
+      .map((t) => ({
+        type: 'function' as const,
+        name: t.function.name,
+        ...(t.function.description ? { description: t.function.description } : {}),
+        ...(t.function.parameters ? { parameters: t.function.parameters } : {}),
+        ...(t.function.strict != null ? { strict: t.function.strict } : {}),
+      }));
+
     const body: ResponsesRequestBody = {
       model: modelId,
-      instructions: systemParts.join('\n\n') || DEFAULT_INSTRUCTIONS,
+      instructions,
+      prompt_cache_key: stablePrefixCacheKey(instructions, tools ?? []),
       input,
       store: false,
       stream,
       include: ['reasoning.encrypted_content'],
     };
 
-    if (options?.tools?.length) {
-      body.tools = options.tools
-        .filter((t) => t.type === 'function' && t.function?.name)
-        .map((t) => ({
-          type: 'function' as const,
-          name: t.function.name,
-          ...(t.function.description ? { description: t.function.description } : {}),
-          ...(t.function.parameters ? { parameters: t.function.parameters } : {}),
-          ...(t.function.strict != null ? { strict: t.function.strict } : {}),
-        }));
-    }
+    if (tools?.length) body.tools = tools;
     if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
     if (options?.parallel_tool_calls != null) body.parallel_tool_calls = options.parallel_tool_calls;
     if (options?.temperature != null) body.temperature = options.temperature;
@@ -349,7 +353,9 @@ export class ChatGptProvider extends BaseProvider {
         });
       }
     }
-    const promptTokens = json.usage?.input_tokens ?? 0;
+    const openAiInputTokens = json.usage?.input_tokens ?? 0;
+    const cachedTokens = json.usage?.input_tokens_details?.cached_tokens ?? 0;
+    const promptTokens = Math.max(0, openAiInputTokens - cachedTokens);
     const completionTokens = json.usage?.output_tokens ?? 0;
     return {
       id: json.id ?? this.makeId(),
@@ -370,7 +376,8 @@ export class ChatGptProvider extends BaseProvider {
       usage: {
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
-        total_tokens: json.usage?.total_tokens ?? promptTokens + completionTokens,
+        total_tokens: json.usage?.total_tokens ?? openAiInputTokens + completionTokens,
+        cache_read_input_tokens: cachedTokens,
       },
       _routed_via: { platform: this.platform, model: modelId },
     };
@@ -450,10 +457,13 @@ export class ChatGptProvider extends BaseProvider {
         );
       } else if (type === 'response.completed' && evt.response?.usage) {
         const u = evt.response.usage;
+        const openAiInputTokens = u.input_tokens ?? 0;
+        const cachedTokens = u.input_tokens_details?.cached_tokens ?? 0;
         usage = {
-          prompt_tokens: u.input_tokens ?? 0,
+          prompt_tokens: Math.max(0, openAiInputTokens - cachedTokens),
           completion_tokens: u.output_tokens ?? 0,
-          total_tokens: u.total_tokens ?? (u.input_tokens ?? 0) + (u.output_tokens ?? 0),
+          total_tokens: u.total_tokens ?? openAiInputTokens + (u.output_tokens ?? 0),
+          cache_read_input_tokens: cachedTokens,
         };
       } else if (type === 'response.failed' || type === 'error') {
         const msg = evt.response?.error?.message ?? evt.error?.message ?? 'ChatGPT Responses stream failed';
@@ -554,6 +564,7 @@ interface ResponsesStreamEvent {
 
 interface ResponsesUsage {
   input_tokens?: number;
+  input_tokens_details?: { cached_tokens?: number };
   output_tokens?: number;
   total_tokens?: number;
 }
@@ -585,6 +596,16 @@ function parseFrame(frame: string): ResponsesStreamEvent | null {
   } catch {
     return null;
   }
+}
+
+function stablePrefixCacheKey(
+  instructions: string,
+  tools: NonNullable<ResponsesRequestBody['tools']>,
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify({ instructions, tools }))
+    .digest('hex');
 }
 
 function cryptoRandomId(): string {

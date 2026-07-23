@@ -16,6 +16,7 @@ export function migrateDbSchema(db: Database.Database) {
   migrateSchemaV29ArchiveProviders(db);
   migrateSchemaV30KeylessProviders(db);
   migrateSchemaV31ApiFormat(db);
+  migrateSchemaV34CacheReadTokens(db);
   seedBuiltInProviderSettings(db);
   migrateEmbeddingsV1(db);
   migrateCustomProvidersV24(db);
@@ -2386,6 +2387,17 @@ function migrateSchemaV31ApiFormat(db: Database.Database) {
   const cols = db.prepare("PRAGMA table_info('custom_providers')").all() as Array<{ name: string }>;
   if (!cols.some(c => c.name === 'api_format')) {
     db.prepare("ALTER TABLE custom_providers ADD COLUMN api_format TEXT DEFAULT 'openai'").run();
+  }
+}
+
+// ── V34: cached-input token analytics (2026-07) ──
+// OpenAI Responses reports cached input separately from uncached input. Preserve
+// that count on request rows so cache-hit behavior stays measurable outside the
+// Anthropic response mapping.
+function migrateSchemaV34CacheReadTokens(db: Database.Database) {
+  const cols = db.prepare("PRAGMA table_info('requests')").all() as Array<{ name: string }>;
+  if (!cols.some(c => c.name === 'cache_read_input_tokens')) {
+    db.prepare('ALTER TABLE requests ADD COLUMN cache_read_input_tokens INTEGER NOT NULL DEFAULT 0').run();
   }
 }
 
