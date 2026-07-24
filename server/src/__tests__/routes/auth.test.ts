@@ -19,6 +19,7 @@ async function call(
   path: string,
   body?: unknown,
   token?: string,
+  extraHeaders?: Record<string, string>,
 ) {
   const server = app.listen(0);
   const addr = server.address() as { port: number };
@@ -30,6 +31,7 @@ async function call(
       // Spoof a remote source IP — the server's `requireAuth` honors this
       // because the test app is configured with `trust proxy = 1`.
       'X-Forwarded-For': REMOTE_IP,
+      ...(extraHeaders ?? {}),
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -69,7 +71,17 @@ describe('Dashboard auth (#35)', () => {
     expect((await call(app, 'GET', '/api/ping')).status).toBe(200);
     // /v1 has its own (unified-key) auth, so it 401s for a different reason —
     // the point is it is not gated by the dashboard session middleware.
-    const proxy = await call(app, 'POST', '/v1/chat/completions', { messages: [{ role: 'user', content: 'x' }] });
+    //
+    // The /v1 data-plane auth (`isLocalCliRequest`) deliberately trusts the
+    // REAL TCP peer, not the forgeable `X-Forwarded-For`, so spoofing a remote
+    // IP is not enough here: the loopback socket peer (127.0.0.1) would qualify
+    // as a key-less local CLI and sail past auth into routing, returning a
+    // 429 `rate_limit_error` from the recovery loop instead of the 401 we want.
+    // A real off-network / browser caller — the scenario this file simulates —
+    // always attaches browser fetch metadata, so send `Sec-Fetch-Site`: that
+    // disqualifies the local-CLI bypass and forces the unified-key check, which
+    // 401s with `authentication_error` for a caller presenting no key.
+    const proxy = await call(app, 'POST', '/v1/chat/completions', { messages: [{ role: 'user', content: 'x' }] }, undefined, { 'Sec-Fetch-Site': 'cross-site' });
     expect(proxy.body.error.type).toBe('authentication_error');
   });
 
