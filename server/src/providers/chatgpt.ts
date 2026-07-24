@@ -219,7 +219,13 @@ export class ChatGptProvider extends BaseProvider {
     // other parameters are preserved. (card c1881)
 
     const effort = options?.reasoning_effort ?? options?.thinking?.effort;
-    if (effort) body.reasoning = { effort: effort === 'xhigh' || effort === 'max' ? 'high' : effort };
+    if (effort) {
+      let clamped = effort === 'xhigh' || effort === 'max' ? 'high' : effort;
+      // gpt-5-codex family has no 'minimal' reasoning preset (API limitation); prior
+      // art jxstanford/opencode-openai-codex-auth remaps minimal->low for codex too.
+      if (clamped === 'minimal' && modelId.toLowerCase().includes('codex')) clamped = 'low';
+      body.reasoning = { effort: clamped };
+    }
 
     if (blobsCompressed > 0) {
       console.log(
