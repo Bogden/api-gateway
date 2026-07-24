@@ -144,6 +144,34 @@ describe('ChatGptProvider', () => {
     expect(capturedBody.top_p).toBe(0.9);
   });
 
+  it('remaps minimal reasoning effort to low on codex models, but not on other models', async () => {
+    writeLogin();
+    const bodies: any[] = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      bodies.push(JSON.parse((init as any).body));
+      return sseResponse([
+        'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
+      ]);
+    });
+
+    // gpt-5-codex has no 'minimal' preset (API limitation) -> remapped to 'low'.
+    await collect(provider.streamChatCompletion(
+      'no-key', [{ role: 'user', content: 'hi' }], 'gpt-5-codex', { reasoning_effort: 'minimal' },
+    ));
+    // Non-codex models keep 'minimal' unchanged.
+    await collect(provider.streamChatCompletion(
+      'no-key', [{ role: 'user', content: 'hi' }], 'gpt-5', { reasoning_effort: 'minimal' },
+    ));
+    // xhigh/max clamp to 'high' regardless of model, unaffected by the codex remap.
+    await collect(provider.streamChatCompletion(
+      'no-key', [{ role: 'user', content: 'hi' }], 'gpt-5-codex', { reasoning_effort: 'xhigh' },
+    ));
+
+    expect(bodies[0].reasoning).toEqual({ effort: 'low' });
+    expect(bodies[1].reasoning).toEqual({ effort: 'minimal' });
+    expect(bodies[2].reasoning).toEqual({ effort: 'high' });
+  });
+
   it('uses the stable system-and-tools prefix for the prompt cache key', async () => {
     writeLogin();
     const bodies: any[] = [];
