@@ -1,5 +1,9 @@
 # Fork Management Rules — API-Gateway
 
+> **Agent sessions:** landing policy lives in [CLAUDE.md](CLAUDE.md) — this repo is
+> pr-only; never self-merge to `main`. §1 below describes branch architecture, not
+> permission to merge.
+
 > **Audience:** AI agents + human maintainers. Follow these rules exactly. Order matters.
 > 
 > **Last updated:** 2026-06-08 after a major rebase of 2 feature branches through upstream's
