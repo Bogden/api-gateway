@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import http from 'node:http';
+import net from 'node:net';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const INSTANCES_FILE = join(ROOT, '.api-gateway.instances');
@@ -84,6 +85,81 @@ function isRunning(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+function checkHostConnect(port, host) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let done = false;
+    const finish = (result) => { if (!done) { done = true; socket.destroy(); resolve(result); } };
+    socket.setTimeout(1000);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+    socket.connect(port, host);
+  });
+}
+
+// Server binds dual-stack '::' by default, so check both loopback families.
+export async function isPortInUse(port) {
+  const results = await Promise.all([
+    checkHostConnect(port, '127.0.0.1'),
+    checkHostConnect(port, '::1'),
+  ]);
+  return results.some(Boolean);
+}
+
+// Best-effort PID discovery for whatever is listening on `port`. Tries a few
+// common system utilities in order and swallows failures (missing tool,
+// permission denied, etc.) since this is diagnostic, not load-bearing.
+export function findPortListenerPid(port) {
+  try {
+    const out = execFileSync('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { encoding: 'utf8', timeout: 3000 }).trim();
+    const pid = parseInt(out.split('\n')[0], 10);
+    if (pid) return pid;
+  } catch {}
+
+  try {
+    const out = execFileSync('fuser', [`${port}/tcp`], { encoding: 'utf8', timeout: 3000 }).trim();
+    const pid = parseInt(out.split(/\s+/)[0], 10);
+    if (pid) return pid;
+  } catch {}
+
+  try {
+    const out = execFileSync('ss', ['-ltnp'], { encoding: 'utf8', timeout: 3000 });
+    for (const line of out.split('\n')) {
+      if (!line.match(new RegExp(`[:.]${port}\\s`))) continue;
+      const m = line.match(/pid=(\d+)/);
+      if (m) return parseInt(m[1], 10);
+    }
+  } catch {}
+
+  return null;
+}
+
+// Best-effort process description (command name + uptime) for a PID found
+// via findPortListenerPid. Purely informational — failures are swallowed.
+export function describePid(pid) {
+  try {
+    const out = execFileSync('ps', ['-o', 'comm=,etimes=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 }).trim();
+    if (!out) return null;
+    const parts = out.split(/\s+/);
+    const etimes = parts.pop();
+    const comm = parts.join(' ');
+    const secs = parseInt(etimes, 10);
+    let uptime = etimes;
+    if (!isNaN(secs)) {
+      if (secs < 60) uptime = `${secs}s`;
+      else if (secs < 3600) uptime = `${Math.floor(secs / 60)}m`;
+      else uptime = `${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m`;
+    }
+    return { comm, uptime };
+  } catch { return null; }
+}
+
+function describeSuffix(pid) {
+  const info = describePid(pid);
+  return info ? ` (${info.comm}, up ${info.uptime})` : '';
+}
+
 function cleanInstances() {
   const inst = readInstances();
   let changed = false;
@@ -118,7 +194,7 @@ async function ensureBuilt() {
   if (needsBuild()) await build();
 }
 
-function startServer(port) {
+async function startServer(port) {
   const inst = cleanInstances();
 
   if (inst[String(port)]) {
@@ -128,6 +204,16 @@ function startServer(port) {
       printInfo(port);
       return;
     }
+  }
+
+  if (await isPortInUse(port)) {
+    const pid = findPortListenerPid(port);
+    console.error(`\nERROR: Port ${port} is already in use by another process.`);
+    if (pid) console.error(`  PID ${pid}${describeSuffix(pid)}`);
+    else console.error('  Could not determine which process is listening on it.');
+    console.error(`  This listener is NOT tracked in .api-gateway.instances.`);
+    console.error(`  Run 'api restart' or 'api stop --port ${port}' to take it over, then start again.\n`);
+    process.exit(1);
   }
 
   rotateLogIfNeeded();
@@ -199,8 +285,10 @@ function waitForReady(port, child) {
     const check = () => {
       const req = http.get(`http://localhost:${port}/api/health`, (res) => {
         res.resume();
-        if (res.statusCode === 200) once(resolve)();
-        else retry();
+        if (res.statusCode === 200) {
+          if (isRunning(child.pid)) once(resolve)();
+          else once(reject)(new Error('Health check returned 200, but the spawned server process is no longer running — another server answered on this port.'));
+        } else retry();
       });
       req.on('error', () => retry());
       req.setTimeout(2000, () => { req.destroy(); retry(); });
@@ -231,18 +319,41 @@ function printInfo(port) {
   console.log(`  Logs:        api logs`);
 }
 
-function stopOne(port) {
+async function stopOne(port) {
   const inst = readInstances();
   const key = String(port);
-  const pid = inst[key];
-  if (!pid) { console.log(`No server running on port ${port}.`); return Promise.resolve(); }
-  if (!isRunning(pid)) {
+  let pid = inst[key];
+  let untracked = false;
+
+  if (!pid) {
+    if (await isPortInUse(port)) {
+      const foundPid = findPortListenerPid(port);
+      if (!foundPid) {
+        console.error(`Port ${port} is in use but the listening process could not be identified. Refusing to proceed.`);
+        process.exit(1);
+      }
+      pid = foundPid;
+      untracked = true;
+      console.log(`Port ${port} is held by an UNTRACKED server (PID ${pid}${describeSuffix(pid)}). Taking it over…`);
+    } else {
+      console.log(`No server running on port ${port}.`);
+      return;
+    }
+  } else if (!isRunning(pid)) {
     console.log(`PID ${pid} on port ${port} is not running. Cleaning up.`);
     delete inst[key];
     if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
     else { writeInstances(inst); }
-    return Promise.resolve();
+    return;
   }
+
+  const untrack = () => {
+    if (untracked) return;
+    delete inst[key];
+    if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
+    else { writeInstances(inst); }
+  };
+
   console.log(`Stopping server on port ${port} (PID ${pid})…`);
   try { process.kill(pid, 'SIGTERM'); } catch (e) { console.log(`Failed: ${e.message}`); }
   return new Promise((resolve) => {
@@ -250,30 +361,34 @@ function stopOne(port) {
     const check = setInterval(() => {
       if (!isRunning(pid)) {
         clearInterval(check);
-        delete inst[key];
-        if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
-        else { writeInstances(inst); }
-        console.log('Server stopped.');
+        untrack();
+        console.log(untracked ? 'Untracked server stopped.' : 'Server stopped.');
         resolve();
         return;
       }
       if (++attempts > 10) {
         try { process.kill(pid, 'SIGKILL'); } catch {}
         clearInterval(check);
-        delete inst[key];
-        if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
-        else { writeInstances(inst); }
-        console.log('Server force-stopped.');
+        untrack();
+        console.log(untracked ? 'Untracked server force-stopped.' : 'Server force-stopped.');
         resolve();
       }
     }, 500);
   });
 }
 
-function stopAll() {
+async function stopAll() {
   const inst = cleanInstances();
-  if (Object.keys(inst).length === 0) { console.log('No servers running.'); return Promise.resolve(); }
-  return Promise.all(Object.keys(inst).map(port => stopOne(parseInt(port, 10))));
+  if (Object.keys(inst).length === 0) { console.log('No servers running.'); }
+  else { await Promise.all(Object.keys(inst).map(port => stopOne(parseInt(port, 10)))); }
+
+  // --all stays tracked-only in scope; just warn if the .env port is still
+  // held by something we didn't touch.
+  const envPort = readPort();
+  if (!inst[String(envPort)] && await isPortInUse(envPort)) {
+    const pid = findPortListenerPid(envPort);
+    console.warn(`\nWarning: port ${envPort} (.env PORT) is held by an UNTRACKED process${pid ? ` (PID ${pid}${describeSuffix(pid)})` : ''}. Not stopped by --all — use 'api stop --port ${envPort}' to take it over.`);
+  }
 }
 
 function showList() {
@@ -350,8 +465,7 @@ async function main() {
 
   if (cmd === 'restart') {
     const envPort = readPort();
-    const inst = cleanInstances();
-    if (inst[String(envPort)]) await stopOne(envPort);
+    await stopOne(envPort);
     await ensureBuilt();
     await startServer(envPort);
     return;
@@ -369,4 +483,6 @@ async function main() {
   process.exit(1);
 }
 
-main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}

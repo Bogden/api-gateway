@@ -628,6 +628,14 @@ instances on different ports are supported. The `api` command is registered
 via the `bin` field in `package.json` — run `npm link` after cloning to
 activate it globally.
 
+`restart` and `stop [--port]` detect an **untracked** process already
+listening on the target port (e.g. a server started outside the CLI) and take
+it over — same SIGTERM→SIGKILL sequence used for tracked PIDs — rather than
+silently leaving it running. `start` never kills anything: if the port is
+already occupied it fails loudly and exits nonzero instead of racing a health
+check against the stale server. `stop --all` stays tracked-only in scope; it
+only warns if the `.env` PORT is still held by something untracked.
+
 ### 8.2 Build & Dev Loop
 
 ```bash
