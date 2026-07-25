@@ -1,5 +1,18 @@
 # api-gateway — rules for agent sessions
 
+## The deployed port is live — never bind it (binding)
+
+- `127.0.0.1:4610` (the HOST/PORT in `.env`) is served by the **running systemd user
+  service** `api-gateway.service`. Never bind that address, and never start, stop, or
+  restart that unit. A hand-started copy on the same address once crash-looped the live
+  service for ~35 minutes (118+ restarts) until the guardian circuit breaker tripped.
+- Do **not** run `node server/dist/index.js` from a checkout that has the deployed
+  `.env`: it inherits the deployed HOST/PORT. The sanctioned way to run a dev instance is
+  `npm run dev`, which defaults the server to `:4611` (dashboard on `:5173`); pass an
+  explicit `PORT` for anything else.
+- The server refuses to start when its configured address is taken, and says so. If you
+  see that message, change your port — do not free the address by killing the holder.
+
 ## Landing policy (binding)
 
 - This repo is registered **pr-only** in the fleet's target registry

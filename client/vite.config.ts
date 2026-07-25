@@ -5,7 +5,10 @@ import path from 'path'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, path.resolve(__dirname, '..'), '')
-  const serverPort = env.PORT ?? process.env.PORT ?? 3001
+  // Must track the dev server's port (server/src/dev.ts), not the PORT in .env —
+  // that one belongs to the deployed service, which dev runs must not touch.
+  // An explicit PORT in the environment still wins, for both halves.
+  const serverPort = process.env.PORT ?? (mode === 'development' ? 4611 : env.PORT ?? 3001)
 
   return {
     plugins: [react(), tailwindcss()],

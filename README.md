@@ -162,7 +162,7 @@ printf "ENCRYPTION_KEY=%s\nPORT=3001\n" "$ENCRYPTION_KEY" > .env
 npm run dev
 ```
 
-Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
+Open http://localhost:5173 (the Vite dev UI) — `npm run dev` serves the API on :4611 and never on the `PORT` in `.env`, so a dev run can't collide with an already-deployed instance. Add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
 
 > **Reaching the dev UI from another device on your LAN?** Use `npm run dev:lan` — it passes `--host` through to Vite, which then prints a `Network: http://<your-ip>:5173` URL you can open from a phone or another machine. (Plain `npm run dev -- --host` does *not* work here: the root `dev` script is a `concurrently` wrapper, so the flag never reaches Vite.) API calls go through Vite's dev proxy, so no extra server config is needed.
 
@@ -170,7 +170,8 @@ For a production build:
 
 ```bash
 npm run build
-node server/dist/index.js     # server + dashboard both served on :3001
+node server/dist/index.js     # server + dashboard both served on PORT (default :3001)
+                              # refuses to start if that address is already in use
 ```
 
 `ENCRYPTION_KEY` is required for startup. The server only falls back to a database-stored development key when `DEV_MODE=true` and `NODE_ENV` is not `production`; do not use that fallback with real provider keys.
@@ -499,7 +500,7 @@ Contributors very welcome! Good first PRs:
 
 ```bash
 npm install
-npm run dev      # server on :3001, dashboard on :5173, both with HMR
+npm run dev      # server on :4611, dashboard on :5173, both with HMR
 npm test         # server vitest; also runs client tests if the workspace adds them
 npm run build    # compile server and dashboard
 ```
