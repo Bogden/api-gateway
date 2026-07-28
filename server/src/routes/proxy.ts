@@ -495,6 +495,10 @@ const chatCompletionSchema = z.object({
   // into the wire shape each upstream accepts. (#290)
   reasoning_effort: thinkingEffortSchema.nullable().optional(),
   thinking: thinkingConfigSchema.nullable().optional(),
+  // Conversation-scoped cache key. Providers that route on cache affinity
+  // (ChatGPT/Codex) use it to keep one conversation on one cache shard; every
+  // other provider ignores it. (card c3025)
+  prompt_cache_key: z.string().nullable().optional(),
 });
 export function isRetryableError(err: any): boolean {
   // Explicit provider opt-out: a deterministic upstream failure (e.g. a 400/422
@@ -655,6 +659,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // CompletionOptions. Explicit nulls are normalized to undefined so the
   // provider-side `if (options?.reasoning_effort)` pattern works. (#290)
   const reasoning_effort = inboundReasoningEffort ?? undefined;
+  const prompt_cache_key = parsed.data.prompt_cache_key ?? undefined;
   const thinking = inboundThinking ?? undefined;
   // Pairing state for id-less tool calls (#200): every tool_call id (given or
   // synthesized) queues up here; a tool message without a tool_call_id takes
@@ -1167,7 +1172,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             route.apiKey, outboundMessages, route.modelId,
             {
               temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls,
-              reasoning_effort, thinking,
+              reasoning_effort, thinking, prompt_cache_key,
               abortSignal,
             },
           );
@@ -1402,7 +1407,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           route.apiKey, outboundMessages, route.modelId,
           {
             temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls,
-            reasoning_effort, thinking,
+            reasoning_effort, thinking, prompt_cache_key,
             abortSignal,
           },
         );
