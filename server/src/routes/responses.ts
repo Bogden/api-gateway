@@ -115,6 +115,9 @@ const responsesRequestSchema = z.object({
     z.object({ type: z.literal('function'), name: z.string() }).passthrough(),
   ]).optional(),
   parallel_tool_calls: z.boolean().nullable().optional(),
+  // Conversation-scoped cache key; honored by cache-affinity providers only.
+  // (card c3025)
+  prompt_cache_key: z.string().nullable().optional(),
 }).passthrough();
 
 type ResponsesRequest = z.infer<typeof responsesRequestSchema>;
@@ -313,6 +316,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     tools,
     tool_choice,
     parallel_tool_calls: reqData.parallel_tool_calls ?? undefined,
+    prompt_cache_key: reqData.prompt_cache_key ?? undefined,
   };
 
   const estimatedInputTokens = messages.reduce(

@@ -182,7 +182,7 @@ export class ChatGptProvider extends BaseProvider {
     const body: ResponsesRequestBody = {
       model: modelId,
       instructions,
-      prompt_cache_key: stablePrefixCacheKey(instructions, tools ?? []),
+      prompt_cache_key: effectiveCacheKey(options?.prompt_cache_key, instructions, tools ?? []),
       input,
       store: false,
       stream,
@@ -215,7 +215,11 @@ export class ChatGptProvider extends BaseProvider {
     return body;
   }
 
-  private async buildHeaders(stream: boolean, forceRefresh = false): Promise<Record<string, string>> {
+  private async buildHeaders(
+    stream: boolean,
+    sessionId: string,
+    forceRefresh = false,
+  ): Promise<Record<string, string>> {
     const cred = await getCodexCredential(forceRefresh);
     const headers: Record<string, string> = {
       Authorization: `Bearer ${cred.accessToken}`,
@@ -226,7 +230,7 @@ export class ChatGptProvider extends BaseProvider {
       originator: 'codex_cli_rs',
       'OpenAI-Beta': 'responses=experimental',
       'User-Agent': 'api-gateway-codex/1.0',
-      session_id: cryptoRandomId(),
+      session_id: sessionId,
     };
     if (cred.accountId) headers['chatgpt-account-id'] = cred.accountId;
     return headers;
@@ -278,8 +282,10 @@ export class ChatGptProvider extends BaseProvider {
     abortSignal?: AbortSignal,
   ): Promise<Response> {
     const url = `${CODEX_RESPONSES_BASE}/responses`;
+    // Same conversation → same session id, for the backend's cache affinity.
+    const sessionId = sessionIdForCacheKey(body.prompt_cache_key);
     const doFetch = async (forceRefresh: boolean) => {
-      const headers = await this.buildHeaders(stream, forceRefresh);
+      const headers = await this.buildHeaders(stream, sessionId, forceRefresh);
       return this.fetchWithTimeout(
         url,
         { method: 'POST', headers, body: JSON.stringify(body) },
@@ -614,7 +620,32 @@ function stablePrefixCacheKey(
     .digest('hex');
 }
 
-function cryptoRandomId(): string {
-  // A per-request session id header the Codex backend expects. Non-security use.
-  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+// The cache key actually sent upstream. Without a caller key, the prefix hash
+// is all the identity we have — but it collides across distinct conversations
+// that share a system prompt and tool set, which is exactly the fleet's shape.
+// A caller-supplied conversation key is mixed in so each conversation gets its
+// own key while still changing when the cached prefix itself changes. (c3025)
+export function effectiveCacheKey(
+  callerKey: string | undefined,
+  instructions: string,
+  tools: NonNullable<ResponsesRequestBody['tools']>,
+): string {
+  if (!callerKey) return stablePrefixCacheKey(instructions, tools);
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify({ callerKey, instructions, tools }))
+    .digest('hex');
+}
+
+// The backend routes on `session_id` for cache affinity, so a fresh random id
+// per request scatters a single conversation across shards and intermittently
+// loses the cached prefix. Derive it deterministically from the cache key
+// instead — same conversation, same id — formatted UUID-shaped (v4 variant
+// bits) so the backend sees a plausible identifier. (c3025)
+export function sessionIdForCacheKey(cacheKey: string): string {
+  const b = crypto.createHash('sha256').update(`session:${cacheKey}`).digest();
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const hex = b.subarray(0, 16).toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
