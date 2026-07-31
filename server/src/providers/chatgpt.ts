@@ -131,13 +131,25 @@ export class ChatGptProvider extends BaseProvider {
   ): ResponsesRequestBody {
     const systemParts: string[] = [];
     const input: ResponsesInputItem[] = [];
+    let isInitialSystemPrefix = true;
 
     for (const m of messages) {
       if (m.role === 'system') {
         const text = contentToString(m.content ?? '');
-        if (text) systemParts.push(text);
+        if (text) {
+          if (isInitialSystemPrefix) {
+            systemParts.push(text);
+          } else {
+            input.push({
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_text', text: `<system-reminder>\n${text}\n</system-reminder>` }],
+            });
+          }
+        }
         continue;
       }
+      isInitialSystemPrefix = false;
       if (m.role === 'tool') {
         input.push({
           type: 'function_call_output',

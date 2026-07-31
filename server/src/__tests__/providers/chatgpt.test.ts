@@ -216,6 +216,46 @@ describe('ChatGptProvider', () => {
     expect(bodies[0].previous_response_id).toBeUndefined();
   });
 
+  it('keeps a late system reminder in input without changing cache affinity', async () => {
+    writeLogin();
+    const calls: Array<{ body: any; headers: any }> = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      calls.push({ body: JSON.parse((init as any).body), headers: (init as any).headers });
+      return sseResponse([
+        'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
+      ]);
+    });
+
+    const tools = [{ type: 'function' as const, function: { name: 'shell', description: 'run', parameters: { type: 'object' } } }];
+    const priorMessages: any[] = [
+      { role: 'system', content: 'be terse' },
+      { role: 'user', content: 'first turn' },
+      { role: 'assistant', content: 'I will check.', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'shell', arguments: '{"command":"pwd"}' } }] },
+      { role: 'tool', tool_call_id: 'call_1', content: '/workspace' },
+      { role: 'user', content: 'continue' },
+    ];
+
+    await collect(provider.streamChatCompletion(
+      'no-key', priorMessages, 'gpt-5-codex', { tools, prompt_cache_key: 'ccrun:stable' },
+    ));
+    await collect(provider.streamChatCompletion(
+      'no-key', [...priorMessages, { role: 'system', content: 'Late reminder: use concise output.' }], 'gpt-5-codex',
+      { tools, prompt_cache_key: 'ccrun:stable' },
+    ));
+
+    const [before, after] = calls;
+    expect(after.body.instructions).toBe(before.body.instructions);
+    expect(after.body.prompt_cache_key).toBe(before.body.prompt_cache_key);
+    expect(after.headers.session_id).toBe(before.headers.session_id);
+    expect(after.body.input.slice(0, before.body.input.length)).toEqual(before.body.input);
+    expect(after.body.input).toHaveLength(before.body.input.length + 1);
+    expect(after.body.input.at(-1)).toEqual({
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: '<system-reminder>\nLate reminder: use concise output.\n</system-reminder>' }],
+    });
+  });
+
   it('keeps session id and cache key stable per conversation key, and distinct across keys', async () => {
     writeLogin();
     const calls: Array<{ body: any; headers: any }> = [];
