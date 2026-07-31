@@ -20,6 +20,7 @@ import {
   setChatgptCooldown,
   clearChatgptCooldown,
   getChatgptCooldown,
+  claimChatgptCooldownProbe,
 } from '../services/chatgpt-cooldown.js';
 import {
   recordChatgptUsageFromHeaders,
@@ -219,7 +220,7 @@ export class ChatGptProvider extends BaseProvider {
     stream: boolean,
     sessionId: string,
     forceRefresh = false,
-  ): Promise<Record<string, string>> {
+  ): Promise<{ headers: Record<string, string>; accountId: string | null }> {
     const cred = await getCodexCredential(forceRefresh);
     const headers: Record<string, string> = {
       Authorization: `Bearer ${cred.accessToken}`,
@@ -233,13 +234,16 @@ export class ChatGptProvider extends BaseProvider {
       session_id: sessionId,
     };
     if (cred.accountId) headers['chatgpt-account-id'] = cred.accountId;
-    return headers;
+    return { headers, accountId: cred.accountId };
   }
 
-  // Guard: refuse to hit the plan while it is cooling down from a prior 429.
-  private assertNotCoolingDown(modelId: string): void {
-    const cd = getChatgptCooldown(modelId);
+  // Guard: refuse to hit the plan while it is cooling down from a prior 429,
+  // except for one exponentially-backed-off revalidation probe. A successful
+  // probe clears the cooldown in post(); another 429 preserves the backoff.
+  private assertNotCoolingDown(modelId: string, accountId: string | null): void {
+    const cd = getChatgptCooldown(modelId, accountId);
     if (cd) {
+      if (claimChatgptCooldownProbe(modelId, accountId)) return;
       throw this.cooldownError(modelId, cd.reason, cd.remainingMs);
     }
   }
@@ -259,7 +263,11 @@ export class ChatGptProvider extends BaseProvider {
   }
 
   // Arm a cooldown from a 429 response and return the distinctive error.
-  private handle429(modelId: string, res: Response): ProviderHttpError {
+  private handle429(
+    modelId: string,
+    res: Response,
+    accountId: string | null,
+  ): ProviderHttpError {
     // Prefer an explicit Retry-After. Absent that, fall back to the last plan-
     // usage snapshot's primary reset time (when it's fresh and still in the
     // future) before the flat default — it reflects the real window boundary.
@@ -270,7 +278,7 @@ export class ChatGptProvider extends BaseProvider {
     // "rate limit", "quota", …) as retryable, which would drive the plan into
     // the 1-RPM recovery loop and hammer it. This cooldown must be terminal.
     const reason = 'Backend signalled the subscription usage window is exhausted.';
-    setChatgptCooldown(modelId, cooldownMs, reason);
+    setChatgptCooldown(modelId, cooldownMs, reason, accountId);
     return this.cooldownError(modelId, reason, cooldownMs);
   }
 
@@ -285,23 +293,25 @@ export class ChatGptProvider extends BaseProvider {
     // Same conversation → same session id, for the backend's cache affinity.
     const sessionId = sessionIdForCacheKey(body.prompt_cache_key);
     const doFetch = async (forceRefresh: boolean) => {
-      const headers = await this.buildHeaders(stream, sessionId, forceRefresh);
-      return this.fetchWithTimeout(
+      const { headers, accountId } = await this.buildHeaders(stream, sessionId, forceRefresh);
+      if (!forceRefresh) this.assertNotCoolingDown(body.model, accountId);
+      const response = await this.fetchWithTimeout(
         url,
         { method: 'POST', headers, body: JSON.stringify(body) },
         this.timeoutMs,
         abortSignal,
       );
+      return { response, accountId };
     };
 
-    let res = await doFetch(false);
+    let { response: res, accountId } = await doFetch(false);
     if (res.status === 401) {
       // Access token rejected despite looking valid — refresh once and retry.
-      res = await doFetch(true);
+      ({ response: res, accountId } = await doFetch(true));
     }
 
     if (res.status === 429) {
-      throw this.handle429(body.model, res);
+      throw this.handle429(body.model, res, accountId);
     }
     if (res.status === 401 || res.status === 403) {
       throw new CodexCredentialsError(
@@ -331,7 +341,7 @@ export class ChatGptProvider extends BaseProvider {
     // Reading headers does not consume the (still-unread) streaming body.
     recordChatgptUsageFromHeaders(res.headers);
     // A successful call clears any prior cooldown for this model.
-    clearChatgptCooldown(body.model);
+    clearChatgptCooldown(body.model, accountId);
     return res;
   }
 
@@ -342,7 +352,6 @@ export class ChatGptProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
-    this.assertNotCoolingDown(modelId);
     const body = this.buildRequestBody(messages, modelId, options, false);
     const res = await this.post(body, false, options?.abortSignal);
     const json = (await res.json()) as ResponsesApiResponse;
@@ -402,7 +411,6 @@ export class ChatGptProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk> {
-    this.assertNotCoolingDown(modelId);
     const body = this.buildRequestBody(messages, modelId, options, true);
     const res = await this.post(body, true, options?.abortSignal);
 

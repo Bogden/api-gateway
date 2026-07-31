@@ -142,6 +142,24 @@ function readAuthFile(): CodexAuthFile | null {
   }
 }
 
+/** The account currently named by the on-disk Codex login, without refreshing
+ * tokens or making a network request. `undefined` means the identity could not
+ * be read; `null` means a readable login had no derivable account id.
+ * Cooldown/status code uses the distinction so a transient credential-file
+ * rewrite cannot erase valid state while an actual account switch can. */
+export function getStoredCodexAccountId(): string | null | undefined {
+  try {
+    const file = readAuthFile();
+    if (!file?.tokens) return undefined;
+    return deriveAccountId(file.tokens);
+  } catch {
+    // Health/status reads must remain available when the credential file is
+    // temporarily malformed. A real provider request will surface the detailed
+    // CodexCredentialsError through getCodexCredential().
+    return undefined;
+  }
+}
+
 function writeAuthFile(file: CodexAuthFile): void {
   const authPath = codexAuthPath();
   try {
