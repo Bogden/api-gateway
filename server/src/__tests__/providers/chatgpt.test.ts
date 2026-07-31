@@ -22,12 +22,12 @@ function jwt(payload: Record<string, unknown>): string {
 }
 
 // A live (far-future) Codex login fixture, so no token refresh is attempted.
-function writeLogin(): void {
+function writeLogin(accountId = 'acct-xyz'): void {
   const farFuture = Math.floor(Date.now() / 1000) + 3600 * 24 * 365;
   fs.writeFileSync(
     codexAuthPath(),
     JSON.stringify({
-      tokens: { access_token: jwt({ exp: farFuture }), refresh_token: 'rt', account_id: 'acct-xyz' },
+      tokens: { access_token: jwt({ exp: farFuture }), refresh_token: 'rt', account_id: accountId },
     }),
   );
 }
@@ -435,6 +435,135 @@ describe('ChatGptProvider', () => {
       collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'again' }], 'gpt-5-codex')),
     ).rejects.toThrow(/usage window exhausted/i);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('revalidates a long cooldown with exponential backoff and clears it on early recovery', async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    writeLogin();
+
+    const recovered = sseResponse([
+      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+    ]);
+    recovered.headers = usageHeaders({ 'x-codex-primary-used-percent': '3' });
+    const fetchSpy = vi.spyOn(global, 'fetch')
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: new Headers({ 'retry-after': String(24 * 60 * 60) }),
+        text: async () => 'rate limited',
+      } as any)
+      .mockResolvedValueOnce(recovered as any);
+
+    await expect(
+      collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'first' }], 'gpt-5-codex')),
+    ).rejects.toThrow(/usage window exhausted/i);
+
+    // Ordinary traffic remains short-circuited before the first probe window.
+    now += 4 * 60 * 1000;
+    await expect(
+      collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'blocked' }], 'gpt-5-codex')),
+    ).rejects.toThrow(/usage window exhausted/i);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // Exactly one request is admitted after five minutes. Its success both
+    // refreshes usage and clears the stale long cooldown.
+    now += 60 * 1000;
+    await collect(
+      provider.streamChatCompletion('no-key', [{ role: 'user', content: 'probe' }], 'gpt-5-codex'),
+    );
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(isChatgptCoolingDown('gpt-5-codex')).toBe(false);
+    expect(getChatgptUsageSnapshots()[0]!.primary!.usedPercent).toBe(3);
+  });
+
+  it('backs off repeated cooldown probes instead of resetting to five-minute polling', async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    writeLogin();
+    const rejection = () => ({
+      ok: false,
+      status: 429,
+      headers: new Headers({ 'retry-after': String(24 * 60 * 60) }),
+      text: async () => 'rate limited',
+    } as any);
+    const fetchSpy = vi.spyOn(global, 'fetch')
+      .mockImplementation(async () => rejection());
+
+    await expect(
+      collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'initial' }], 'gpt-5-codex')),
+    ).rejects.toThrow(/usage window exhausted/i);
+
+    now += 5 * 60 * 1000;
+    await expect(
+      collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'first probe' }], 'gpt-5-codex')),
+    ).rejects.toThrow(/usage window exhausted/i);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    // A rejected first probe advances the next window to ten minutes. It does
+    // not restart the five-minute cadence when handle429 re-arms the cooldown.
+    now += 5 * 60 * 1000;
+    await expect(
+      collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'too soon' }], 'gpt-5-codex')),
+    ).rejects.toThrow(/usage window exhausted/i);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    now += 5 * 60 * 1000;
+    await expect(
+      collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'second probe' }], 'gpt-5-codex')),
+    ).rejects.toThrow(/usage window exhausted/i);
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not carry a cooldown across a Codex account switch', async () => {
+    writeLogin('acct-old');
+    const ok = sseResponse([
+      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+    ]);
+    const fetchSpy = vi.spyOn(global, 'fetch')
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: new Headers({ 'retry-after': String(24 * 60 * 60) }),
+        text: async () => 'rate limited',
+      } as any)
+      .mockResolvedValueOnce(ok as any);
+
+    await expect(
+      collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'old' }], 'gpt-5-codex')),
+    ).rejects.toThrow(/usage window exhausted/i);
+    expect(getActiveChatgptCooldowns()).toHaveLength(1);
+
+    writeLogin('acct-new');
+    // The status surface must stop reporting the old account before a provider
+    // request, otherwise the console's pre-dispatch health gate still blocks.
+    expect(getActiveChatgptCooldowns()).toHaveLength(0);
+
+    await collect(
+      provider.streamChatCompletion('no-key', [{ role: 'user', content: 'new' }], 'gpt-5-codex'),
+    );
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('preserves cooldown status while the credential file is temporarily unreadable', async () => {
+    writeLogin('acct-stable');
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: false,
+      status: 429,
+      headers: new Headers({ 'retry-after': String(24 * 60 * 60) }),
+      text: async () => 'rate limited',
+    } as any);
+
+    await expect(
+      collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'arm' }], 'gpt-5-codex')),
+    ).rejects.toThrow(/usage window exhausted/i);
+    expect(getActiveChatgptCooldowns()).toHaveLength(1);
+
+    fs.writeFileSync(codexAuthPath(), '{');
+    expect(getActiveChatgptCooldowns()).toHaveLength(1);
+
+    writeLogin('acct-stable');
+    expect(getActiveChatgptCooldowns()).toHaveLength(1);
   });
 
   it('captures the plan-usage snapshot from response headers on a streaming turn', async () => {

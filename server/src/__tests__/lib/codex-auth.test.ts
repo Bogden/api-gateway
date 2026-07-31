@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { getCodexCredential, CodexCredentialsError, codexAuthPath } from '../../lib/codex-auth.js';
+import {
+  getCodexCredential,
+  getStoredCodexAccountId,
+  CodexCredentialsError,
+  codexAuthPath,
+} from '../../lib/codex-auth.js';
 
 // Build an unsigned JWT with the given payload (base64url).
 function jwt(payload: Record<string, unknown>): string {
@@ -56,6 +61,40 @@ describe('codex-auth', () => {
     expect(cred.accessToken).toContain('.');
     // No refresh should have been attempted for a live token.
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('reads the stored account id without refreshing tokens', () => {
+    home = tmpCodexHome();
+    process.env.CODEX_HOME = home;
+    const expired = Math.floor(Date.now() / 1000) - 10;
+    fs.writeFileSync(
+      codexAuthPath(),
+      JSON.stringify({
+        tokens: {
+          access_token: jwt({ exp: expired }),
+          refresh_token: 'rt-abc',
+          account_id: 'acct-status',
+        },
+      }),
+    );
+    const fetchSpy = vi.spyOn(global, 'fetch');
+    expect(getStoredCodexAccountId()).toBe('acct-status');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('distinguishes an unreadable credential store from a readable login with no account id', () => {
+    home = tmpCodexHome();
+    process.env.CODEX_HOME = home;
+    expect(getStoredCodexAccountId()).toBeUndefined();
+
+    fs.writeFileSync(codexAuthPath(), '{');
+    expect(getStoredCodexAccountId()).toBeUndefined();
+
+    fs.writeFileSync(
+      codexAuthPath(),
+      JSON.stringify({ tokens: { access_token: 'opaque', refresh_token: 'rt' } }),
+    );
+    expect(getStoredCodexAccountId()).toBeNull();
   });
 
   it('derives the account id from the id_token claim when account_id is absent', async () => {
