@@ -87,7 +87,11 @@ interface ResponsesRequestBody {
   // Subscription OAuth requires store:false; some OpenAI cache controls are
   // dropped under it, which we accept.
   store: false;
-  stream: boolean;
+  // ALWAYS true. The subscription Responses backend rejects `stream:false`
+  // unconditionally (HTTP 400 {"detail":"Stream must be set to true"}), so the
+  // non-streaming client path consumes the SSE stream internally and assembles
+  // a single response instead. There is no stream:false path left. (card c3153)
+  stream: true;
   // The Codex backend expects encrypted reasoning to be carried across turns.
   include: string[];
 }
@@ -127,7 +131,6 @@ export class ChatGptProvider extends BaseProvider {
     messages: ChatMessage[],
     modelId: string,
     options: CompletionOptions | undefined,
-    stream: boolean,
   ): ResponsesRequestBody {
     const systemParts: string[] = [];
     const input: ResponsesInputItem[] = [];
@@ -198,7 +201,7 @@ export class ChatGptProvider extends BaseProvider {
       prompt_cache_key: effectiveCacheKey(options?.prompt_cache_key, instructions, tools ?? []),
       input,
       store: false,
-      stream,
+      stream: true,
       include: ['reasoning.encrypted_content'],
     };
 
@@ -229,7 +232,6 @@ export class ChatGptProvider extends BaseProvider {
   }
 
   private async buildHeaders(
-    stream: boolean,
     sessionId: string,
     forceRefresh = false,
   ): Promise<{ headers: Record<string, string>; accountId: string | null }> {
@@ -237,7 +239,7 @@ export class ChatGptProvider extends BaseProvider {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${cred.accessToken}`,
       'Content-Type': 'application/json',
-      Accept: stream ? 'text/event-stream' : 'application/json',
+      Accept: 'text/event-stream',
       // Codex requires these on every request; dropping chatgpt-account-id
       // causes 401/403 from the backend.
       originator: 'codex_cli_rs',
@@ -298,14 +300,13 @@ export class ChatGptProvider extends BaseProvider {
   // reactive refresh-and-retry path). Throws on non-OK responses.
   private async post(
     body: ResponsesRequestBody,
-    stream: boolean,
     abortSignal?: AbortSignal,
   ): Promise<Response> {
     const url = `${CODEX_RESPONSES_BASE}/responses`;
     // Same conversation → same session id, for the backend's cache affinity.
     const sessionId = sessionIdForCacheKey(body.prompt_cache_key);
     const doFetch = async (forceRefresh: boolean) => {
-      const { headers, accountId } = await this.buildHeaders(stream, sessionId, forceRefresh);
+      const { headers, accountId } = await this.buildHeaders(sessionId, forceRefresh);
       if (!forceRefresh) this.assertNotCoolingDown(body.model, accountId);
       const response = await this.fetchWithTimeout(
         url,
@@ -358,40 +359,48 @@ export class ChatGptProvider extends BaseProvider {
   }
 
   // ── Non-streaming completion ───────────────────────────────────────────────
+  //
+  // The upstream request is ALWAYS streaming (the backend rejects stream:false
+  // outright — card c3153). For a client that asked for a non-streaming reply we
+  // drive the very same event pipeline the streaming path uses, discard the
+  // per-delta chunks, and assemble the accumulated state into one response.
   async chatCompletion(
     _apiKey: string,
     messages: ChatMessage[],
     modelId: string,
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
-    const body = this.buildRequestBody(messages, modelId, options, false);
-    const res = await this.post(body, false, options?.abortSignal);
-    const json = (await res.json()) as ResponsesApiResponse;
-    return this.toCompletionResponse(json, modelId);
+    const body = this.buildRequestBody(messages, modelId, options);
+    const res = await this.post(body, options?.abortSignal);
+
+    const state = newStreamState();
+    // Drain the shared pipeline to completion; mid-stream upstream errors throw
+    // out of here exactly as they do on the streaming path.
+    for await (const _chunk of this.streamChunks(res, modelId, state, options?.abortSignal)) {
+      /* chunks are the streaming projection; the aggregate lives in `state` */
+    }
+    // A stream that ends without a terminal completion event is a truncated
+    // turn, not an empty success — surface it rather than returning a blank
+    // assistant message.
+    if (!state.sawCompleted) {
+      throw new Error(
+        'ChatGPT Responses stream error: upstream stream ended without a response.completed event',
+      );
+    }
+    return this.toCompletionResponse(state, modelId);
   }
 
-  private toCompletionResponse(json: ResponsesApiResponse, modelId: string): ChatCompletionResponse {
-    let text = '';
-    const toolCalls: ChatToolCall[] = [];
-    for (const item of json.output ?? []) {
-      if (item.type === 'message') {
-        for (const part of item.content ?? []) {
-          if (part.type === 'output_text' && typeof part.text === 'string') text += part.text;
-        }
-      } else if (item.type === 'function_call') {
-        toolCalls.push({
-          id: item.call_id ?? item.id ?? '',
-          type: 'function',
-          function: { name: item.name ?? '', arguments: item.arguments ?? '' },
-        });
-      }
-    }
-    const openAiInputTokens = json.usage?.input_tokens ?? 0;
-    const cachedTokens = json.usage?.input_tokens_details?.cached_tokens ?? 0;
-    const promptTokens = Math.max(0, openAiInputTokens - cachedTokens);
-    const completionTokens = json.usage?.output_tokens ?? 0;
+  // Assemble the accumulated stream state into a single non-streaming response.
+  private toCompletionResponse(state: StreamState, modelId: string): ChatCompletionResponse {
+    const toolCalls: ChatToolCall[] = [...state.toolCalls.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, tc]) => ({
+        id: tc.id,
+        type: 'function' as const,
+        function: { name: tc.name, arguments: tc.arguments },
+      }));
     return {
-      id: json.id ?? this.makeId(),
+      id: state.responseId ?? this.makeId(),
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: modelId,
@@ -400,17 +409,18 @@ export class ChatGptProvider extends BaseProvider {
           index: 0,
           message: {
             role: 'assistant',
-            content: text || null,
+            content: state.text || null,
+            ...(state.reasoning ? { reasoning_content: state.reasoning } : {}),
             ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
           },
           finish_reason: toolCalls.length ? 'tool_calls' : 'stop',
         },
       ],
-      usage: {
-        prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        total_tokens: json.usage?.total_tokens ?? openAiInputTokens + completionTokens,
-        cache_read_input_tokens: cachedTokens,
+      usage: state.usage ?? {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+        cache_read_input_tokens: 0,
       },
       _routed_via: { platform: this.platform, model: modelId },
     };
@@ -423,9 +433,21 @@ export class ChatGptProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk> {
-    const body = this.buildRequestBody(messages, modelId, options, true);
-    const res = await this.post(body, true, options?.abortSignal);
+    const body = this.buildRequestBody(messages, modelId, options);
+    const res = await this.post(body, options?.abortSignal);
+    yield* this.streamChunks(res, modelId, newStreamState(), options?.abortSignal);
+  }
 
+  // The ONE routine that turns an upstream Responses SSE body into gateway
+  // chunks. It yields the streaming projection AND accumulates the complete
+  // turn (text, reasoning, tool calls, usage, finish reason) into `state`, so
+  // both client-facing shapes are derived from identical semantics.
+  private async *streamChunks(
+    res: Response,
+    modelId: string,
+    state: StreamState,
+    abortSignal?: AbortSignal,
+  ): AsyncGenerator<ChatCompletionChunk> {
     const created = Math.floor(Date.now() / 1000);
     const id = this.makeId();
     const mkChunk = (
@@ -446,31 +468,33 @@ export class ChatGptProvider extends BaseProvider {
     // output_index, so we translate through this map.
     const toolIndexByOutput = new Map<number, number>();
     let nextToolIndex = 0;
-    let sawToolCall = false;
-    let usage: ChatCompletionChunk['usage'] | undefined;
 
-    for await (const evt of this.readResponsesStream(res, modelId, options?.abortSignal)) {
+    for await (const evt of this.readResponsesStream(res, modelId, abortSignal)) {
       const type = evt.type;
       if (type === 'response.output_text.delta' && typeof evt.delta === 'string') {
+        state.text += evt.delta;
         yield mkChunk({ content: evt.delta }, null);
       } else if (
         (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_text.delta') &&
         typeof evt.delta === 'string'
       ) {
+        state.reasoning += evt.delta;
         yield mkChunk({ reasoning_content: evt.delta }, null);
       } else if (type === 'response.output_item.added' && evt.item?.type === 'function_call') {
         const outputIndex = typeof evt.output_index === 'number' ? evt.output_index : nextToolIndex;
         const toolIndex = nextToolIndex++;
         toolIndexByOutput.set(outputIndex, toolIndex);
-        sawToolCall = true;
+        const callId = evt.item.call_id ?? evt.item.id ?? '';
+        const name = evt.item.name ?? '';
+        state.toolCalls.set(toolIndex, { id: callId, name, arguments: '' });
         yield mkChunk(
           {
             tool_calls: [
               {
                 index: toolIndex,
-                id: evt.item.call_id ?? evt.item.id ?? '',
+                id: callId,
                 type: 'function',
-                function: { name: evt.item.name ?? '', arguments: '' },
+                function: { name, arguments: '' },
               },
             ] as unknown as ChatToolCall[],
           },
@@ -479,6 +503,8 @@ export class ChatGptProvider extends BaseProvider {
       } else if (type === 'response.function_call_arguments.delta' && typeof evt.delta === 'string') {
         const outputIndex = typeof evt.output_index === 'number' ? evt.output_index : 0;
         const toolIndex = toolIndexByOutput.get(outputIndex) ?? 0;
+        const existing = state.toolCalls.get(toolIndex);
+        if (existing) existing.arguments += evt.delta;
         yield mkChunk(
           {
             tool_calls: [
@@ -487,16 +513,20 @@ export class ChatGptProvider extends BaseProvider {
           },
           null,
         );
-      } else if (type === 'response.completed' && evt.response?.usage) {
-        const u = evt.response.usage;
-        const openAiInputTokens = u.input_tokens ?? 0;
-        const cachedTokens = u.input_tokens_details?.cached_tokens ?? 0;
-        usage = {
-          prompt_tokens: Math.max(0, openAiInputTokens - cachedTokens),
-          completion_tokens: u.output_tokens ?? 0,
-          total_tokens: u.total_tokens ?? openAiInputTokens + (u.output_tokens ?? 0),
-          cache_read_input_tokens: cachedTokens,
-        };
+      } else if (type === 'response.completed') {
+        state.sawCompleted = true;
+        if (typeof evt.response?.id === 'string') state.responseId = evt.response.id;
+        if (evt.response?.usage) {
+          const u = evt.response.usage;
+          const openAiInputTokens = u.input_tokens ?? 0;
+          const cachedTokens = u.input_tokens_details?.cached_tokens ?? 0;
+          state.usage = {
+            prompt_tokens: Math.max(0, openAiInputTokens - cachedTokens),
+            completion_tokens: u.output_tokens ?? 0,
+            total_tokens: u.total_tokens ?? openAiInputTokens + (u.output_tokens ?? 0),
+            cache_read_input_tokens: cachedTokens,
+          };
+        }
       } else if (type === 'response.failed' || type === 'error') {
         const msg = evt.response?.error?.message ?? evt.error?.message ?? 'ChatGPT Responses stream failed';
         throw new Error(`ChatGPT Responses stream error: ${msg}`);
@@ -510,9 +540,9 @@ export class ChatGptProvider extends BaseProvider {
     // finish chunk (which carries a choice) makes the proxy silently drop it,
     // so the client never sees token counts. Split them to match the shape the
     // proxy expects.
-    yield mkChunk({}, sawToolCall ? 'tool_calls' : 'stop');
-    if (usage) {
-      yield { id, object: 'chat.completion.chunk', created, model: modelId, choices: [], usage };
+    yield mkChunk({}, state.toolCalls.size ? 'tool_calls' : 'stop');
+    if (state.usage) {
+      yield { id, object: 'chat.completion.chunk', created, model: modelId, choices: [], usage: state.usage };
     }
   }
 
@@ -589,7 +619,7 @@ interface ResponsesStreamEvent {
   delta?: unknown;
   output_index?: number;
   item?: { type?: string; id?: string; call_id?: string; name?: string };
-  response?: { usage?: ResponsesUsage; error?: { message?: string } };
+  response?: { id?: string; usage?: ResponsesUsage; error?: { message?: string } };
   error?: { message?: string };
   [key: string]: unknown;
 }
@@ -601,17 +631,20 @@ interface ResponsesUsage {
   total_tokens?: number;
 }
 
-interface ResponsesApiResponse {
-  id?: string;
-  output?: Array<{
-    type?: string;
-    id?: string;
-    call_id?: string;
-    name?: string;
-    arguments?: string;
-    content?: Array<{ type?: string; text?: string }>;
-  }>;
-  usage?: ResponsesUsage;
+// The complete turn as accumulated off the SSE stream. The streaming path
+// projects each event into a chunk as it goes; the non-streaming path reads the
+// finished state. Both are filled by the same routine (streamChunks).
+interface StreamState {
+  text: string;
+  reasoning: string;
+  toolCalls: Map<number, { id: string; name: string; arguments: string }>;
+  usage?: ChatCompletionResponse['usage'];
+  responseId?: string;
+  sawCompleted: boolean;
+}
+
+function newStreamState(): StreamState {
+  return { text: '', reasoning: '', toolCalls: new Map(), sawCompleted: false };
 }
 
 function parseFrame(frame: string): ResponsesStreamEvent | null {

@@ -404,33 +404,105 @@ describe('ChatGptProvider', () => {
     expect(finishChunk.choices[0]?.finish_reason).toBe('tool_calls');
   });
 
-  it('extracts text + usage from a non-streaming completion', async () => {
+  // The subscription backend rejects stream:false unconditionally (HTTP 400
+  // {"detail":"Stream must be set to true"}), so the client-facing non-streaming
+  // path now drives a streaming upstream and assembles the result. (card c3153)
+  it('sends stream:true upstream even when the client asked for a non-streaming reply', async () => {
     writeLogin();
-    vi.spyOn(global, 'fetch').mockResolvedValue({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      json: async () => ({
-        id: 'resp_1',
-        output: [{ type: 'message', content: [{ type: 'output_text', text: 'hello world' }] }],
-        usage: {
-          input_tokens: 5,
-          input_tokens_details: { cached_tokens: 3 },
-          output_tokens: 2,
-          total_tokens: 7,
-        },
-      }),
-    } as any);
+    let capturedBody: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      expect((init as any).headers['Accept']).toBe('text/event-stream');
+      return sseResponse([
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+      ]);
+    });
 
-    const res = await provider.chatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5');
-    expect(res.choices[0]?.message.content).toBe('hello world');
+    await provider.chatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5');
+    expect(capturedBody.stream).toBe(true);
+  });
+
+  it('assembles one non-streaming response from a multi-chunk SSE upstream', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValue(
+      sseResponse([
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Let me "}\n\n',
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"check. "}\n\n',
+        'event: response.reasoning_text.delta\ndata: {"type":"response.reasoning_text.delta","delta":"thinking"}\n\n',
+        'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"get_weather"}}\n\n',
+        'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\\"city\\":"}\n\n',
+        'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"\\"paris\\"}"}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":8},"output_tokens":7,"total_tokens":19}}}\n\n',
+      ]) as any,
+    );
+
+    const res = await provider.chatCompletion('no-key', [{ role: 'user', content: 'weather?' }], 'gpt-5');
+
+    expect(res.id).toBe('resp_1');
+    expect(res.choices[0]?.message.content).toBe('Let me check. ');
+    expect(res.choices[0]?.message.reasoning_content).toBe('thinking');
+    expect(res.choices[0]?.finish_reason).toBe('tool_calls');
+    const calls = res.choices[0]?.message.tool_calls ?? [];
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.id).toBe('call_abc');
+    expect(calls[0]!.function.name).toBe('get_weather');
+    // Arguments must be concatenated across chunks, not just the last delta.
+    expect(JSON.parse(calls[0]!.function.arguments)).toEqual({ city: 'paris' });
     expect(res.usage).toEqual({
-      prompt_tokens: 2,
-      completion_tokens: 2,
-      total_tokens: 7,
-      cache_read_input_tokens: 3,
+      prompt_tokens: 4,
+      completion_tokens: 7,
+      total_tokens: 19,
+      cache_read_input_tokens: 8,
     });
     expect(res._routed_via?.platform).toBe('chatgpt');
+  });
+
+  it('surfaces an upstream error on the non-streaming path as the provider error', async () => {
+    writeLogin();
+    const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({
+      ok: false,
+      status: 400,
+      headers: new Headers(),
+      text: async () => '{"detail":"Stream must be set to true"}',
+    } as any);
+
+    let err: any;
+    try {
+      await provider.chatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5');
+    } catch (e) { err = e; }
+    expect(err).toBeDefined();
+    expect(err.status).toBe(400);
+    expect(err.retryable).toBe(false);
+    expect(err.message).toMatch(/Stream must be set to true/);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces a mid-stream upstream failure on the non-streaming path', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValue(
+      sseResponse([
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"par"}\n\n',
+        'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"message":"upstream exploded"}}}\n\n',
+      ]) as any,
+    );
+
+    await expect(
+      provider.chatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5'),
+    ).rejects.toThrow(/upstream exploded/);
+  });
+
+  it('treats a stream that ends without a completion event as an error, not an empty success', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValue(
+      sseResponse([
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"half a "}\n\n',
+      ]) as any,
+    );
+
+    await expect(
+      provider.chatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5'),
+    ).rejects.toThrow(/without a response.completed/);
   });
 
   it('raises an actionable creds error when there is no Codex login (no upstream call)', async () => {
@@ -625,16 +697,12 @@ describe('ChatGptProvider', () => {
 
   it('captures the plan-usage snapshot from response headers on a non-streaming turn', async () => {
     writeLogin();
-    vi.spyOn(global, 'fetch').mockResolvedValue({
-      ok: true,
-      status: 200,
-      headers: usageHeaders({ 'x-codex-primary-used-percent': '55' }),
-      json: async () => ({
-        id: 'resp_1',
-        output: [{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }],
-        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-      }),
-    } as any);
+    const res = sseResponse([
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+    ]);
+    res.headers = usageHeaders({ 'x-codex-primary-used-percent': '55' });
+    vi.spyOn(global, 'fetch').mockResolvedValue(res as any);
 
     await provider.chatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5');
     const snaps = getChatgptUsageSnapshots();
