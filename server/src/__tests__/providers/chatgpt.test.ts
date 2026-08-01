@@ -477,6 +477,36 @@ describe('ChatGptProvider', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('caps a multi-week Retry-After at the 24h ceiling in both the error message and the stored cooldown', async () => {
+    writeLogin();
+    const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({
+      ok: false,
+      status: 429,
+      // 2,506,200s ~= 41770 min (~29 days) — an observed upstream value far
+      // past any useful cooldown horizon.
+      headers: new Headers({ 'retry-after': '2506200' }),
+      text: async () => 'rate limited',
+    } as any);
+
+    let err: any;
+    try {
+      await collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5-codex'));
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('CHATGPT_COOLDOWN');
+
+    const mins = Number(/~(\d+) min/.exec(err.message)?.[1]);
+    expect(mins).toBeLessThanOrEqual(1440);
+
+    const active = getActiveChatgptCooldowns();
+    expect(active).toHaveLength(1);
+    expect(active[0]!.modelId).toBe('gpt-5-codex');
+    expect(active[0]!.remainingMs).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('revalidates a long cooldown with exponential backoff and clears it on early recovery', async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);

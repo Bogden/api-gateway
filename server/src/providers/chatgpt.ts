@@ -61,6 +61,9 @@ const CODEX_RESPONSES_BASE = 'https://chatgpt.com/backend-api/codex';
 // the model for a conservative default rather than probing every few seconds.
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
 
+/** Hard ceiling on a subscription cooldown. An upstream Retry-After or a plan-usage reset hint can name a multi-week window (observed ~29 days for one rung), which benches that model far past any useful horizon. The revalidation probe re-arms the cooldown on the next 429, so capping costs at most one probe request per day. */
+const MAX_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
 // When a 429 carries no Retry-After, a recent plan-usage snapshot's primary
 // window reset is a better cooldown estimate than the flat default — but only
 // while it's fresh enough to still describe the live window.
@@ -286,12 +289,13 @@ export class ChatGptProvider extends BaseProvider {
     const retryAfterMs = parseRetryAfterMs(res.headers?.get('retry-after'));
     const cooldownMs =
       retryAfterMs ?? getChatgptCooldownHintMs(USAGE_SNAPSHOT_MAX_AGE_MS) ?? DEFAULT_COOLDOWN_MS;
+    const cappedMs = Math.min(cooldownMs, MAX_COOLDOWN_MS);
     // Deliberately digit-free: the proxy's retry classifier treats "429" (and
     // "rate limit", "quota", …) as retryable, which would drive the plan into
     // the 1-RPM recovery loop and hammer it. This cooldown must be terminal.
     const reason = 'Backend signalled the subscription usage window is exhausted.';
-    setChatgptCooldown(modelId, cooldownMs, reason, accountId);
-    return this.cooldownError(modelId, reason, cooldownMs);
+    setChatgptCooldown(modelId, cappedMs, reason, accountId);
+    return this.cooldownError(modelId, reason, cappedMs);
   }
 
   // POST to the Responses endpoint, refreshing the token once on a 401 (the
