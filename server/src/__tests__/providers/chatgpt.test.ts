@@ -145,6 +145,71 @@ describe('ChatGptProvider', () => {
     expect(capturedBody.top_p).toBe(0.9);
   });
 
+  it('preserves ordered text and image parts in the upstream Responses request', async () => {
+    writeLogin();
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return sseResponse([
+        'event: response.completed\\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\\n\\n',
+      ]);
+    });
+    await collect(provider.streamChatCompletion('no-key', [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'before' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+        { type: 'text', text: 'after' },
+        { type: 'image_url', image_url: { url: 'https://example.com/image.png' } },
+      ],
+    }], 'gpt-5', {}));
+    expect(capturedBody.input).toEqual([{
+      type: 'message', role: 'user', content: [
+        { type: 'input_text', text: 'before' },
+        { type: 'input_image', image_url: 'data:image/png;base64,AAAA' },
+        { type: 'input_text', text: 'after' },
+        { type: 'input_image', image_url: 'https://example.com/image.png' },
+      ],
+    }]);
+  });
+
+  it('rejects unsupported image shapes before contacting Codex', async () => {
+    writeLogin();
+    const fetchSpy = vi.spyOn(global, 'fetch');
+    await expect(collect(provider.streamChatCompletion('no-key', [{
+      role: 'user',
+      content: [{ type: 'image_url', image_url: 'https://example.com/image.png' }],
+    }], 'gpt-5', {}))).rejects.toThrow(/image_url parts must use the object shape/i);
+    await expect(collect(provider.streamChatCompletion('no-key', [{
+      role: 'user',
+      content: [{ image_url: { url: 'https://example.com/image.png' } }],
+    }], 'gpt-5', {}))).rejects.toThrow(/image-bearing.*missing/i);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects image blocks in system and tool messages before contacting Codex', async () => {
+    writeLogin();
+    const fetchSpy = vi.spyOn(global, 'fetch');
+    for (const message of [
+      { role: 'system', content: [{ type: 'image_url', image_url: { url: 'https://example.com/system.png' } }] },
+      { role: 'tool', tool_call_id: 'call_1', content: [{ type: 'image_url', image_url: { url: 'https://example.com/tool.png' } }] },
+    ] as any[]) {
+      await expect(collect(provider.streamChatCompletion('no-key', [message], 'gpt-5', {}))).rejects.toThrow(/user messages/i);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects provider-generated image output instead of returning an empty completion', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({ id: 'r', output: [{ type: 'message', content: [{ type: 'output_image', image_url: 'data:image/png;base64,AAAA' }] }] }),
+    } as any);
+    await expect(provider.chatCompletion('no-key', [{ role: 'user', content: 'draw' }], 'gpt-5', {})).rejects.toThrow(/provider image output/i);
+  });
+
   it('remaps minimal reasoning effort to low on codex models, but not on other models', async () => {
     writeLogin();
     const bodies: any[] = [];
@@ -351,6 +416,43 @@ describe('ChatGptProvider', () => {
     } catch (e) { err500 = e; }
     expect(err500.retryable).toBeUndefined();
     expect(err500.status).toBe(500);
+  });
+
+  it('rejects malformed stream JSON before emitting a successful terminal chunk', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValue(sseResponse([
+      'event: response.output_text.delta\ndata: {not-json}\n\n',
+    ]) as any);
+
+    let err: any;
+    try {
+      await collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5'));
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err).toMatchObject({ status: 400, retryable: false });
+    expect(err.message).toMatch(/malformed JSON/i);
+  });
+
+  it('rejects malformed stream JSON after a text delta without a success terminator', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValue(sseResponse([
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+      'event: response.output_text.delta\ndata: {not-json}\n\n',
+    ]) as any);
+
+    const chunks: ChatCompletionChunk[] = [];
+    let err: any;
+    try {
+      for await (const chunk of provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5')) chunks.push(chunk);
+    } catch (e) {
+      err = e;
+    }
+    expect(chunks.map((chunk) => chunk.choices[0]?.delta?.content).filter(Boolean)).toEqual(['partial']);
+    expect(chunks.some((chunk) => chunk.choices[0]?.finish_reason === 'stop')).toBe(false);
+    expect(err).toMatchObject({ status: 400, retryable: false });
+    expect(err.message).toMatch(/malformed JSON/i);
   });
 
   it('streams a happy-path turn with a tool call and extracts usage', async () => {

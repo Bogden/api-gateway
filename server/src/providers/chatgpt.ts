@@ -92,10 +92,82 @@ interface ResponsesRequestBody {
   include: string[];
 }
 
+type ResponsesInputContentPart =
+  | { type: 'input_text' | 'output_text'; text: string }
+  | { type: 'input_image'; image_url: string };
+
 type ResponsesInputItem =
-  | { type: 'message'; role: 'user' | 'assistant'; content: Array<{ type: 'input_text' | 'output_text'; text: string }> }
+  | { type: 'message'; role: 'user' | 'assistant'; content: ResponsesInputContentPart[] }
   | { type: 'function_call'; call_id: string; name: string; arguments: string }
   | { type: 'function_call_output'; call_id: string; output: string };
+
+class ChatGptTranslationError extends Error {
+  readonly status = 400;
+  readonly retryable = false;
+
+  constructor(message: string) {
+    super(`ChatGPT Responses translation rejected input: ${message}`);
+    this.name = 'ChatGptTranslationError';
+  }
+}
+
+function imageUrlFromBlock(block: Record<string, unknown>): string {
+  const imageUrl = block.image_url;
+  if (!imageUrl || typeof imageUrl !== 'object' || Array.isArray(imageUrl)) {
+    throw new ChatGptTranslationError(
+      "image_url parts must use the object shape { image_url: { url: string } }",
+    );
+  }
+  const url = (imageUrl as { url?: unknown }).url;
+  if (typeof url !== 'string' || !url.trim() || (!url.startsWith('data:') && !/^https?:\/\//i.test(url))) {
+    throw new ChatGptTranslationError(
+      'image_url.url must be a non-empty data URL or http(s) URL',
+    );
+  }
+  return url;
+}
+
+function responsesContentParts(
+  content: ChatMessage['content'],
+  role: 'user' | 'assistant',
+): ResponsesInputContentPart[] {
+  if (typeof content === 'string') {
+    return [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: content }];
+  }
+  if (content == null) return [];
+
+  const parts: ResponsesInputContentPart[] = [];
+  for (const raw of content) {
+    if (typeof raw === 'string') {
+      parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: raw });
+      continue;
+    }
+    const block = raw as Record<string, unknown>;
+    const type = typeof block.type === 'string' ? block.type : undefined;
+    const looksImageLike = block.image_url != null || block.image != null || block.source != null;
+    if (type === 'image_url') {
+      if (role !== 'user') {
+        throw new ChatGptTranslationError('images are supported only in user messages');
+      }
+      parts.push({ type: 'input_image', image_url: imageUrlFromBlock(block) });
+      continue;
+    }
+    if (type === 'image' || type === 'input_image') {
+      throw new ChatGptTranslationError(
+        'only image_url parts with image_url.url are supported for image input',
+      );
+    }
+    if ((type === 'text' || type === 'input_text' || type === 'output_text' || type === undefined) && typeof block.text === 'string' && !looksImageLike) {
+      parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: block.text });
+      continue;
+    }
+    if (looksImageLike) {
+      throw new ChatGptTranslationError(`unsupported image-bearing content part type '${type ?? 'missing'}'`);
+    }
+    throw new ChatGptTranslationError(`unsupported content part type '${type ?? 'missing'}'`);
+  }
+  return parts;
+}
 
 export class ChatGptProvider extends BaseProvider {
   readonly platform: Platform = 'chatgpt';
@@ -135,7 +207,18 @@ export class ChatGptProvider extends BaseProvider {
 
     for (const m of messages) {
       if (m.role === 'system') {
-        const text = contentToString(m.content ?? '');
+        if (Array.isArray(m.content) && m.content.some((raw) => {
+          if (typeof raw === 'string') return false;
+          const block = raw as Record<string, unknown>;
+          return block.type === 'image_url' || block.type === 'image' || block.type === 'input_image' || block.image_url != null || block.image != null || block.source != null;
+        })) {
+          throw new ChatGptTranslationError('images are supported only in user messages');
+        }
+        const parts = responsesContentParts(m.content ?? '', 'user');
+        const text = parts
+          .filter((part): part is { type: 'input_text'; text: string } => part.type === 'input_text')
+          .map((part) => part.text)
+          .join('');
         if (text) {
           if (isInitialSystemPrefix) {
             systemParts.push(text);
@@ -151,6 +234,12 @@ export class ChatGptProvider extends BaseProvider {
       }
       isInitialSystemPrefix = false;
       if (m.role === 'tool') {
+        if (Array.isArray(m.content)) {
+          responsesContentParts(m.content, 'user');
+          if (m.content.some((raw) => typeof raw !== 'string' && (raw as Record<string, unknown>).type === 'image_url')) {
+            throw new ChatGptTranslationError('images are supported only in user messages');
+          }
+        }
         input.push({
           type: 'function_call_output',
           call_id: m.tool_call_id ?? '',
@@ -159,9 +248,9 @@ export class ChatGptProvider extends BaseProvider {
         continue;
       }
       if (m.role === 'assistant') {
-        const text = contentToString(m.content ?? '');
-        if (text) {
-          input.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] });
+        const content = responsesContentParts(m.content ?? '', 'assistant');
+        if (content.length) {
+          input.push({ type: 'message', role: 'assistant', content });
         }
         for (const tc of m.tool_calls ?? []) {
           input.push({
@@ -173,12 +262,11 @@ export class ChatGptProvider extends BaseProvider {
         }
         continue;
       }
-      // user (and any other non-system role) → input_text message
-      input.push({
-        type: 'message',
-        role: 'user',
-        content: [{ type: 'input_text', text: contentToString(m.content ?? '') }],
-      });
+      // user (and any other non-system role) → Responses message parts.
+      const content = responsesContentParts(m.content ?? '', 'user');
+      if (content.length) {
+        input.push({ type: 'message', role: 'user', content });
+      }
     }
 
     const instructions = systemParts.join('\n\n') || DEFAULT_INSTRUCTIONS;
@@ -376,7 +464,11 @@ export class ChatGptProvider extends BaseProvider {
     for (const item of json.output ?? []) {
       if (item.type === 'message') {
         for (const part of item.content ?? []) {
-          if (part.type === 'output_text' && typeof part.text === 'string') text += part.text;
+          if (part.type === 'output_text' && typeof part.text === 'string') {
+            text += part.text;
+          } else if (part.type?.includes('image')) {
+            throw new ChatGptTranslationError(`provider image output type '${part.type}' is not supported`);
+          }
         }
       } else if (item.type === 'function_call') {
         toolCalls.push({
@@ -458,6 +550,10 @@ export class ChatGptProvider extends BaseProvider {
         typeof evt.delta === 'string'
       ) {
         yield mkChunk({ reasoning_content: evt.delta }, null);
+      } else if (type === 'response.output_item.added' && evt.item?.type?.includes('image')) {
+        throw new ChatGptTranslationError(`provider image output type '${evt.item.type}' is not supported`);
+      } else if (type === 'response.output_item.added' && evt.item?.type === 'message' && evt.item.content?.some((part) => part.type?.includes('image'))) {
+        throw new ChatGptTranslationError('provider image output content is not supported');
       } else if (type === 'response.output_item.added' && evt.item?.type === 'function_call') {
         const outputIndex = typeof evt.output_index === 'number' ? evt.output_index : nextToolIndex;
         const toolIndex = nextToolIndex++;
@@ -519,7 +615,9 @@ export class ChatGptProvider extends BaseProvider {
   // Parse the Responses SSE stream into typed event objects. The Responses API
   // frames events as `event: <name>` + one or more `data: <json>` lines
   // terminated by a blank line; every data payload also carries a `type` field,
-  // which is what we key on downstream. Malformed frames are skipped.
+  // which is what we key on downstream. Comments and blank keepalives are skipped,
+  // but malformed non-empty data payloads fail the request rather than producing
+  // an apparently successful partial completion.
   private async *readResponsesStream(
     res: Response,
     modelId: string,
@@ -588,7 +686,7 @@ interface ResponsesStreamEvent {
   type?: string;
   delta?: unknown;
   output_index?: number;
-  item?: { type?: string; id?: string; call_id?: string; name?: string };
+  item?: { type?: string; id?: string; call_id?: string; name?: string; content?: Array<{ type?: string }> };
   response?: { usage?: ResponsesUsage; error?: { message?: string } };
   error?: { message?: string };
   [key: string]: unknown;
@@ -626,7 +724,7 @@ function parseFrame(frame: string): ResponsesStreamEvent | null {
   try {
     return JSON.parse(data) as ResponsesStreamEvent;
   } catch {
-    return null;
+    throw new ChatGptTranslationError('received malformed JSON in an upstream response stream');
   }
 }
 

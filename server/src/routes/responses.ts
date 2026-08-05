@@ -7,8 +7,9 @@ import type {
   ChatToolCall,
   ChatToolDefinition,
   ChatToolChoice,
+  ChatContentBlock,
 } from '@api-gateway/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, hasEnabledVisionModel, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
@@ -17,6 +18,7 @@ import {
   isRetryableError,
   isPaymentRequiredError,
   isAuthorizedV1Request,
+  ensureChatgptModel,
   extractApiToken,
   getStickyModel,
   setStickyModel,
@@ -26,6 +28,7 @@ import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { attachClientAbort, isAbortError } from '../lib/abort.js';
 import { getGlobalRetryLimit } from '../services/router.js';
 import { publish } from '../services/events.js';
+import { getDb } from '../db/index.js';
 
 export const responsesRouter = Router();
 
@@ -122,31 +125,110 @@ const responsesRequestSchema = z.object({
 
 type ResponsesRequest = z.infer<typeof responsesRequestSchema>;
 
-// Responses content parts → plain text. input_text / output_text both carry
-// `text`; other part types (images, etc.) are dropped (parity with the proxy).
-function partsToString(content: string | Array<{ type: string; text?: unknown }>): string {
-  if (typeof content === 'string') return content;
-  return content
-    .map((p) => (typeof p.text === 'string' ? p.text : ''))
-    .join('');
+// Responses content parts → the internal OpenAI content envelope. Text and
+// images stay in their original order so vision-capable providers see the
+// same prompt the client sent.
+type ResponsesContentPart = { type?: string; text?: unknown; image_url?: unknown; image?: unknown; source?: unknown };
+
+function looksImageLike(part: ResponsesContentPart): boolean {
+  return part.image_url != null || part.image != null || part.source != null;
 }
 
-// Image input via the Responses API isn't carried through translation yet
-// (partsToString flattens to text). Detect it so we can hard-fail with a clear
-// pointer to /v1/chat/completions rather than silently dropping the image
-// (#118, #125). Recognizes the Responses `input_image` part plus the
-// chat-style `image_url` / `image` parts some clients reuse here.
+function imageUrlFromPart(part: ResponsesContentPart): string {
+  if (part.type === 'input_image') {
+    if (typeof part.image_url !== 'string' || !part.image_url.trim()) {
+      throw new Error('input_image.image_url must be a non-empty data URL or http(s) URL');
+    }
+    return part.image_url;
+  }
+
+  if (!part.image_url || typeof part.image_url !== 'object' || Array.isArray(part.image_url)) {
+    throw new Error('image_url parts must use the object shape { image_url: { url: string } }');
+  }
+  const url = (part.image_url as { url?: unknown }).url;
+  if (typeof url !== 'string' || !url.trim()) {
+    throw new Error('image_url.url must be a non-empty data URL or http(s) URL');
+  }
+  return url;
+}
+
+function validateImageUrl(url: string): string {
+  if (!url.startsWith('data:') && !/^https?:\/\//i.test(url)) {
+    throw new Error('image URL must be a data URL or http(s) URL');
+  }
+  return url;
+}
+
+function partsToContent(content: string | ResponsesContentPart[]): ChatMessage['content'] {
+  if (typeof content === 'string') return content;
+  const parts: ChatContentBlock[] = [];
+  for (const part of content) {
+    if (part.type === 'input_text' || part.type === 'output_text') {
+      if (typeof part.text !== 'string') {
+        throw new Error(`${part.type}.text must be a string`);
+      }
+      parts.push({ type: 'text', text: part.text });
+      continue;
+    }
+    if (part.type === 'input_image' || part.type === 'image_url') {
+      parts.push({ type: 'image_url', image_url: { url: validateImageUrl(imageUrlFromPart(part)) } });
+      continue;
+    }
+    if (looksImageLike(part)) {
+      throw new Error(`unsupported image-bearing Responses content part type '${part.type ?? 'missing'}'`);
+    }
+    throw new Error(`unsupported Responses content part type '${part.type ?? 'missing'}'`);
+  }
+  const hasImage = parts.some((part) => typeof part !== 'string' && part.type === 'image_url');
+  return hasImage ? parts : parts.map((part) => typeof part === 'string' ? part : part.text ?? '').join('');
+}
+
+function partsToString(content: string | ResponsesContentPart[]): string {
+  const converted = partsToContent(content);
+  if (Array.isArray(converted) && converted.some((part) => typeof part !== 'string' && part.type === 'image_url')) {
+    throw new Error('image input is not supported in function_call_output');
+  }
+  return contentToString(converted);
+}
+
+// Identify image parts for vision routing. Conversion and validation below
+// reject malformed or unsupported shapes before any provider is called.
 export function responsesInputHasImage(req: ResponsesRequest): boolean {
   if (typeof req.input === 'string') return false;
-  for (const item of req.input) {
+  return req.input.some((item) => {
     const content = (item as { content?: unknown }).content;
-    if (!Array.isArray(content)) continue;
-    if (content.some((p) => {
-      const type = (p as { type?: string })?.type;
-      return type === 'input_image' || type === 'image_url' || type === 'image';
-    })) return true;
+    return Array.isArray(content) && content.some((part) => {
+      const type = (part as { type?: unknown })?.type;
+      return type === 'input_image' || type === 'image_url';
+    });
+  });
+}
+
+function validateResponsesInput(req: ResponsesRequest): void {
+  if (typeof req.input === 'string') return;
+  for (const item of req.input) {
+    if (item.type === 'function_call_output') {
+      if (Array.isArray(item.output)) {
+        if (item.output.some((part) => part.type === 'input_image' || part.type === 'image_url' || looksImageLike(part))) {
+          throw new Error('image input is supported only in user messages');
+        }
+        partsToString(item.output as ResponsesContentPart[]);
+      } else if (typeof item.output !== 'string') {
+        throw new Error('function_call_output.output must be a string or an array of text content parts');
+      }
+      continue;
+    }
+    if ('role' in item && 'content' in item) {
+      const content = item.content;
+      if (Array.isArray(content)) {
+        const hasImage = content.some((part) => part.type === 'input_image' || part.type === 'image_url' || looksImageLike(part));
+        if (hasImage && item.role !== 'user') {
+          throw new Error('image input is supported only in user messages');
+        }
+        partsToContent(content);
+      }
+    }
   }
-  return false;
 }
 
 // ── Translate a Responses request → internal chat messages + options ──────
@@ -174,18 +256,19 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
         }],
       });
     } else if ('type' in item && item.type === 'function_call_output') {
+      if (typeof item.output !== 'string' && !Array.isArray(item.output)) {
+        throw new Error('function_call_output.output must be a string or an array of text content parts');
+      }
       const output = typeof item.output === 'string'
         ? item.output
-        : Array.isArray(item.output)
-          ? partsToString(item.output as any)
-          : JSON.stringify(item.output);
+        : partsToString(item.output as ResponsesContentPart[]);
       messages.push({ role: 'tool', tool_call_id: item.call_id, content: output });
     } else {
       // message item
       const m = item as z.infer<typeof messageItemSchema>;
       // 'developer' is the Responses-era system role.
       const role = m.role === 'developer' ? 'system' : m.role;
-      messages.push({ role, content: partsToString(m.content) });
+      messages.push({ role, content: partsToContent(m.content as string | ResponsesContentPart[]) });
     }
   }
 
@@ -287,14 +370,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
   const reqData = parsed.data;
 
-  // Vision isn't carried through the Responses translation yet — fail clearly
-  // instead of answering blind to a dropped image (#118, #125).
-  if (responsesInputHasImage(reqData)) {
-    res.status(422).json({
+  try {
+    validateResponsesInput(reqData);
+  } catch (err: any) {
+    res.status(400).json({
       error: {
-        message: 'Image input is not yet supported on /v1/responses. Use /v1/chat/completions with an image_url content part instead.',
+        message: `Unsupported Responses input: ${err.message}`,
         type: 'invalid_request_error',
-        code: 'no_vision_model',
+        code: 'unsupported_image_input',
       },
     });
     return;
@@ -302,6 +385,17 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
   const stream = reqData.stream ?? false;
   const messages = toChatMessages(reqData);
+  const hasImage = responsesInputHasImage(reqData);
+  if (hasImage && !hasEnabledVisionModel()) {
+    res.status(422).json({
+      error: {
+        message: 'This request includes an image, but no vision-capable model is enabled. Enable a vision model in the Fallback Chain.',
+        type: 'invalid_request_error',
+        code: 'no_vision_model',
+      },
+    });
+    return;
+  }
   const tools = toChatTools(reqData.tools);
   // name → parameter schema, for repairing double-encoded tool arguments on
   // the way back out (see lib/tool-args.ts).
@@ -323,11 +417,47 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     (sum, m) => sum + Math.ceil(contentToString(m.content).length / 4),
     0,
   );
-  const estimatedTotal = estimatedInputTokens + (reqData.max_output_tokens ?? 1000);
-  // Optional client-managed session affinity (mirrors /chat/completions).
+  const imageCount = messages.reduce((count, message) => count + (
+    Array.isArray(message.content)
+      ? message.content.filter((part) => typeof part !== 'string' && part.type === 'image_url').length
+      : 0
+  ), 0);
+  const estimatedTotal = estimatedInputTokens + imageCount * 1000 + (reqData.max_output_tokens ?? 1000);
+  // Explicit model requests pin exactly as /chat/completions does. In particular,
+  // arbitrary gpt-* ids provision a ChatGPT subscription row rather than being
+  // ignored in favor of sticky/automatic routing.
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
-  const preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
+  const requestedModel = reqData.model?.trim();
+  const isAutoModel = !requestedModel || requestedModel === 'auto';
+  let preferredModel: number | undefined;
+  if (isAutoModel) {
+    preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
+  } else {
+    const db = getDb();
+    const slashIdx = requestedModel.indexOf('/');
+    let enabled: { id: number } | undefined;
+    if (slashIdx > 0) {
+      enabled = db.prepare(
+        'SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1',
+      ).get(requestedModel.slice(0, slashIdx), requestedModel.slice(slashIdx + 1)) as { id: number } | undefined;
+    }
+    if (!enabled) {
+      enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+    }
+    if (!enabled) enabled = ensureChatgptModel(db, requestedModel);
+    if (!enabled) {
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' is disabled or not in the catalog. Use 'auto' (or omit the 'model' field) to auto-route.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+    preferredModel = enabled.id;
+  }
 
   // Tool-bearing requests (the normal case for Codex/agent clients on this
   // endpoint) must stay on models that emit structured tool_calls — a model
@@ -379,9 +509,17 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     }
     // ---- Exit: upstream attempt cap reached ----
     if (upstreamAttempts >= attemptLimit) break;
-    let route: RouteResult;
+    let route: RouteResult | undefined;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools, skipModels.size > 0 ? skipModels : undefined);
+      route = routeRequest(
+        estimatedTotal,
+        skipKeys.size > 0 ? skipKeys : undefined,
+        preferredModel,
+        hasImage,
+        wantsTools,
+        skipModels.size > 0 ? skipModels : undefined,
+        { pinMode: !isAutoModel },
+      );
     } catch (err: any) {
       const status = lastError ? 429 : (err.status ?? 503);
       const message = lastError
@@ -686,6 +824,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
       const latency = Date.now() - start;
       const safeError = sanitizeProviderErrorMessage(err.message);
+      if (!route) {
+        if (!res.headersSent) res.status(err.status ?? 502).json({ error: { message: safeError, type: 'provider_error' } });
+        return;
+      }
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
 
       // Mid-stream failures can't be retried (bytes already sent) — close cleanly.
@@ -707,10 +849,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         continue;
       }
 
-      res.status(502).json({ error: { message: `Provider error (${route.displayName}): ${safeError}`, type: 'provider_error' } });
+      const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 600 ? err.status : 502;
+      const type = status < 500 ? 'invalid_request_error' : 'provider_error';
+      res.status(status).json({ error: { message: `Provider error (${route.displayName}): ${safeError}`, type } });
       return;
     } finally {
-      route.release();
+      route?.release();
     }
   }
 

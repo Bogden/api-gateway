@@ -10,7 +10,7 @@ vi.mock('../../services/router.js', async (importOriginal) => {
 
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
-import { initDb, getUnifiedApiKey } from '../../db/index.js';
+import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 
 function fakeRoute(provider: any) {
   return { provider, modelId: 'fake-model', modelDbId: 9999, apiKey: 'k', keyId: 1, platform: 'fake', displayName: 'Fake Model', release: () => {} };
@@ -51,20 +51,54 @@ describe('POST /v1/responses (#96)', () => {
     expect((await post(app, '/v1/responses', { model: 'auto' }, key)).status).toBe(400);
   });
 
-  // #118: image input isn't carried through the Responses translation yet, so
-  // it must hard-fail clearly rather than silently answer blind to the image.
-  it('rejects image input with a clear 422 pointing at /v1/chat/completions', async () => {
+  it('rejects malformed image input with a clear 400', async () => {
     const { status, text } = await post(app, '/v1/responses', {
-      input: [{
-        role: 'user',
-        content: [
-          { type: 'input_text', text: 'what is this?' },
-          { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' },
-        ],
-      }],
+      input: [{ role: 'user', content: [{ type: 'input_image', image_url: { url: 'https://example.com/image.png' } }] }],
+    }, key);
+    expect(status).toBe(400);
+    expect(JSON.parse(text).error.code).toBe('unsupported_image_input');
+    expect(JSON.parse(text).error.message).toMatch(/input_image/);
+  });
+
+  it('rejects image input when no vision-capable model is enabled', async () => {
+    getDb().prepare('UPDATE models SET supports_vision = 0').run();
+    const { status, text } = await post(app, '/v1/responses', {
+      input: [{ role: 'user', content: [{ type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' }] }],
     }, key);
     expect(status).toBe(422);
     expect(JSON.parse(text).error.code).toBe('no_vision_model');
+    getDb().prepare("UPDATE models SET supports_vision = 1 WHERE platform = 'google' OR platform = 'chatgpt'").run();
+  });
+
+  it('forwards image requests through the vision route', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion(_key: string, messages: any[]) {
+        expect(messages[0].content).toEqual([
+          { type: 'text', text: 'before' },
+          { type: 'image_url', image_url: { url: 'https://example.com/image.png' } },
+          { type: 'text', text: 'after' },
+        ]);
+        return { id: 'c', object: 'chat.completion', created: 0, model: 'fake-model', choices: [{ index: 0, message: { role: 'assistant', content: 'seen' }, finish_reason: 'stop' }], usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 } };
+      },
+      async *streamChatCompletion() { /* unused */ },
+    }));
+    const { status } = await post(app, '/v1/responses', {
+      input: [{ role: 'user', content: [
+        { type: 'input_text', text: 'before' },
+        { type: 'input_image', image_url: 'https://example.com/image.png' },
+        { type: 'input_text', text: 'after' },
+      ] }],
+    }, key);
+    expect(status).toBe(200);
+    expect(mockRouteRequest).toHaveBeenCalledWith(expect.any(Number), undefined, undefined, true, false, undefined, { pinMode: false });
+  });
+
+  it('rejects image content in assistant messages', async () => {
+    const { status, text } = await post(app, '/v1/responses', {
+      input: [{ role: 'assistant', content: [{ type: 'input_image', image_url: 'https://example.com/image.png' }] }],
+    }, key);
+    expect(status).toBe(400);
+    expect(JSON.parse(text).error.message).toMatch(/user messages/);
   });
 
   // #103: the x-api-key header (Anthropic wire format) must authenticate here
@@ -126,6 +160,33 @@ describe('POST /v1/responses (#96)', () => {
     // the terminal event carries the assembled text
     const completed = text.split('event: response.completed')[1];
     expect(completed).toContain('"output_text":"Hello"');
+  });
+
+  it('pins an explicit Responses gpt model instead of ignoring it', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() {
+        return { id: 'c', object: 'chat.completion', created: 0, model: 'gpt-explicit', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } };
+      },
+      async *streamChatCompletion() { /* unused */ },
+    }));
+    const { status } = await post(app, '/v1/responses', { model: 'gpt-explicit', input: 'hi' }, key);
+    expect(status).toBe(200);
+    expect(mockRouteRequest).toHaveBeenCalledWith(expect.any(Number), undefined, expect.any(Number), false, false, undefined, { pinMode: true });
+  });
+
+  it('preserves a deterministic provider 400 instead of flattening it to 502', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() {
+        const err: any = new Error('translation rejected input');
+        err.status = 400;
+        err.retryable = false;
+        throw err;
+      },
+      async *streamChatCompletion() { /* unused */ },
+    }));
+    const { status, text } = await post(app, '/v1/responses', { input: 'hi' }, key);
+    expect(status).toBe(400);
+    expect(JSON.parse(text).error.type).toBe('invalid_request_error');
   });
 
   it('stream: tool-call deltas produce function_call events with assembled arguments', async () => {
