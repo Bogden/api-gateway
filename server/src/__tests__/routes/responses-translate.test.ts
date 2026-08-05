@@ -19,7 +19,28 @@ describe('Responses → chat translation (#96)', () => {
     expect(msgs[1]).toEqual({ role: 'user', content: 'hi' });
   });
 
-  it('flattens message items with content parts and maps the developer role to system', () => {
+  it('preserves ordered text and canonical input_image parts', () => {
+    const msgs = toChatMessages({ input: [{ type: 'message', role: 'user', content: [
+      { type: 'input_text', text: 'before' },
+      { type: 'input_image', image_url: 'data:image/png;base64,AAAA' },
+      { type: 'input_text', text: 'after' },
+    ] }] } as any);
+    expect(msgs).toEqual([{ role: 'user', content: [
+      { type: 'text', text: 'before' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+      { type: 'text', text: 'after' },
+    ] }]);
+  });
+
+  it('accepts the compatibility image_url object shape', () => {
+    expect(toChatMessages({ input: [{ type: 'message', role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'https://example.com/image.png' } },
+    ] }] } as any)[0].content).toEqual([
+      { type: 'image_url', image_url: { url: 'https://example.com/image.png' } },
+    ]);
+  });
+
+  it('maps text-only message arrays and developer role to system', () => {
     const msgs = toChatMessages({
       input: [
         { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'sys' }] },
@@ -30,6 +51,15 @@ describe('Responses → chat translation (#96)', () => {
       { role: 'system', content: 'sys' },
       { role: 'user', content: 'ab' },
     ]);
+  });
+
+  it('rejects malformed and unsupported image shapes loudly', () => {
+    expect(() => toChatMessages({ input: [{ type: 'message', role: 'user', content: [
+      { type: 'image_url', image_url: 'https://example.com/image.png' },
+    ] }] } as any)).toThrow(/image_url/);
+    expect(() => toChatMessages({ input: [{ type: 'message', role: 'user', content: [
+      { type: 'image' },
+    ] }] } as any)).toThrow(/unsupported Responses content part type/);
   });
 
   it('maps a function_call item to an assistant tool_call', () => {
