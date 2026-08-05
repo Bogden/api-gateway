@@ -175,7 +175,11 @@ function partsToContent(content: string | ResponsesContentPart[]): ChatMessage['
 }
 
 function partsToString(content: string | ResponsesContentPart[]): string {
-  return contentToString(partsToContent(content));
+  const converted = partsToContent(content);
+  if (Array.isArray(converted) && converted.some((part) => typeof part !== 'string' && part.type === 'image_url')) {
+    throw new Error('image input is not supported in function_call_output');
+  }
+  return contentToString(converted);
 }
 
 // Identify image parts for vision routing. Conversion and validation below
