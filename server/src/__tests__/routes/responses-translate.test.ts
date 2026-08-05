@@ -80,6 +80,21 @@ describe('Responses → chat translation (#96)', () => {
     expect(msgs[0]).toEqual({ role: 'tool', tool_call_id: 'call_1', content: 'sunny' });
   });
 
+  it('rejects object-shaped function output instead of flattening image-bearing data into text', () => {
+    expect(() => toChatMessages({
+      input: [{ type: 'function_call_output', call_id: 'call_1', output: { image_url: 'https://example.com/image.png' } }],
+    } as any)).toThrow(/function_call_output\.output/);
+  });
+
+  it('rejects image-like parts whose type is missing or unrecognized', () => {
+    expect(() => toChatMessages({ input: [{ role: 'user', content: [
+      { image_url: { url: 'https://example.com/image.png' } },
+    ] }] } as any)).toThrow(/image-bearing.*missing/);
+    expect(() => toChatMessages({ input: [{ role: 'user', content: [
+      { type: 'future_image', source: { data: 'AAAA' } },
+    ] }] } as any)).toThrow(/image-bearing.*future_image/);
+  });
+
   it('converts flat Responses tools to nested chat tools', () => {
     const tools = toChatTools([
       { type: 'function', name: 'f', description: 'd', parameters: { type: 'object' }, strict: true },

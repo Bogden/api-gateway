@@ -18,6 +18,7 @@ import {
   isRetryableError,
   isPaymentRequiredError,
   isAuthorizedV1Request,
+  ensureChatgptModel,
   extractApiToken,
   getStickyModel,
   setStickyModel,
@@ -27,6 +28,7 @@ import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { attachClientAbort, isAbortError } from '../lib/abort.js';
 import { getGlobalRetryLimit } from '../services/router.js';
 import { publish } from '../services/events.js';
+import { getDb } from '../db/index.js';
 
 export const responsesRouter = Router();
 
@@ -126,7 +128,11 @@ type ResponsesRequest = z.infer<typeof responsesRequestSchema>;
 // Responses content parts → the internal OpenAI content envelope. Text and
 // images stay in their original order so vision-capable providers see the
 // same prompt the client sent.
-type ResponsesContentPart = { type: string; text?: unknown; image_url?: unknown };
+type ResponsesContentPart = { type?: string; text?: unknown; image_url?: unknown; image?: unknown; source?: unknown };
+
+function looksImageLike(part: ResponsesContentPart): boolean {
+  return part.image_url != null || part.image != null || part.source != null;
+}
 
 function imageUrlFromPart(part: ResponsesContentPart): string {
   if (part.type === 'input_image') {
@@ -168,7 +174,10 @@ function partsToContent(content: string | ResponsesContentPart[]): ChatMessage['
       parts.push({ type: 'image_url', image_url: { url: validateImageUrl(imageUrlFromPart(part)) } });
       continue;
     }
-    throw new Error(`unsupported Responses content part type '${part.type}'`);
+    if (looksImageLike(part)) {
+      throw new Error(`unsupported image-bearing Responses content part type '${part.type ?? 'missing'}'`);
+    }
+    throw new Error(`unsupported Responses content part type '${part.type ?? 'missing'}'`);
   }
   const hasImage = parts.some((part) => typeof part !== 'string' && part.type === 'image_url');
   return hasImage ? parts : parts.map((part) => typeof part === 'string' ? part : part.text ?? '').join('');
@@ -200,17 +209,19 @@ function validateResponsesInput(req: ResponsesRequest): void {
   for (const item of req.input) {
     if (item.type === 'function_call_output') {
       if (Array.isArray(item.output)) {
-        if (item.output.some((part) => part.type === 'input_image' || part.type === 'image_url')) {
+        if (item.output.some((part) => part.type === 'input_image' || part.type === 'image_url' || looksImageLike(part))) {
           throw new Error('image input is supported only in user messages');
         }
         partsToString(item.output as ResponsesContentPart[]);
+      } else if (typeof item.output !== 'string') {
+        throw new Error('function_call_output.output must be a string or an array of text content parts');
       }
       continue;
     }
     if ('role' in item && 'content' in item) {
       const content = item.content;
       if (Array.isArray(content)) {
-        const hasImage = content.some((part) => part.type === 'input_image' || part.type === 'image_url');
+        const hasImage = content.some((part) => part.type === 'input_image' || part.type === 'image_url' || looksImageLike(part));
         if (hasImage && item.role !== 'user') {
           throw new Error('image input is supported only in user messages');
         }
@@ -245,11 +256,12 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
         }],
       });
     } else if ('type' in item && item.type === 'function_call_output') {
+      if (typeof item.output !== 'string' && !Array.isArray(item.output)) {
+        throw new Error('function_call_output.output must be a string or an array of text content parts');
+      }
       const output = typeof item.output === 'string'
         ? item.output
-        : Array.isArray(item.output)
-          ? partsToString(item.output as any)
-          : JSON.stringify(item.output);
+        : partsToString(item.output as ResponsesContentPart[]);
       messages.push({ role: 'tool', tool_call_id: item.call_id, content: output });
     } else {
       // message item
@@ -411,10 +423,41 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       : 0
   ), 0);
   const estimatedTotal = estimatedInputTokens + imageCount * 1000 + (reqData.max_output_tokens ?? 1000);
-  // Optional client-managed session affinity (mirrors /chat/completions).
+  // Explicit model requests pin exactly as /chat/completions does. In particular,
+  // arbitrary gpt-* ids provision a ChatGPT subscription row rather than being
+  // ignored in favor of sticky/automatic routing.
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
-  const preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
+  const requestedModel = reqData.model?.trim();
+  const isAutoModel = !requestedModel || requestedModel === 'auto';
+  let preferredModel: number | undefined;
+  if (isAutoModel) {
+    preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
+  } else {
+    const db = getDb();
+    const slashIdx = requestedModel.indexOf('/');
+    let enabled: { id: number } | undefined;
+    if (slashIdx > 0) {
+      enabled = db.prepare(
+        'SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1',
+      ).get(requestedModel.slice(0, slashIdx), requestedModel.slice(slashIdx + 1)) as { id: number } | undefined;
+    }
+    if (!enabled) {
+      enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+    }
+    if (!enabled) enabled = ensureChatgptModel(db, requestedModel);
+    if (!enabled) {
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' is disabled or not in the catalog. Use 'auto' (or omit the 'model' field) to auto-route.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+    preferredModel = enabled.id;
+  }
 
   // Tool-bearing requests (the normal case for Codex/agent clients on this
   // endpoint) must stay on models that emit structured tool_calls — a model
@@ -468,7 +511,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     if (upstreamAttempts >= attemptLimit) break;
     let route: RouteResult | undefined;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage, wantsTools, skipModels.size > 0 ? skipModels : undefined);
+      route = routeRequest(
+        estimatedTotal,
+        skipKeys.size > 0 ? skipKeys : undefined,
+        preferredModel,
+        hasImage,
+        wantsTools,
+        skipModels.size > 0 ? skipModels : undefined,
+        { pinMode: !isAutoModel },
+      );
     } catch (err: any) {
       const status = lastError ? 429 : (err.status ?? 503);
       const message = lastError
@@ -798,7 +849,9 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         continue;
       }
 
-      res.status(502).json({ error: { message: `Provider error (${route.displayName}): ${safeError}`, type: 'provider_error' } });
+      const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 600 ? err.status : 502;
+      const type = status < 500 ? 'invalid_request_error' : 'provider_error';
+      res.status(status).json({ error: { message: `Provider error (${route.displayName}): ${safeError}`, type } });
       return;
     } finally {
       route?.release();

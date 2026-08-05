@@ -144,6 +144,7 @@ function responsesContentParts(
     }
     const block = raw as Record<string, unknown>;
     const type = typeof block.type === 'string' ? block.type : undefined;
+    const looksImageLike = block.image_url != null || block.image != null || block.source != null;
     if (type === 'image_url') {
       if (role !== 'user') {
         throw new ChatGptTranslationError('images are supported only in user messages');
@@ -156,13 +157,14 @@ function responsesContentParts(
         'only image_url parts with image_url.url are supported for image input',
       );
     }
-    if ((type === 'text' || type === 'input_text' || type === 'output_text' || type === undefined) && typeof block.text === 'string') {
+    if ((type === 'text' || type === 'input_text' || type === 'output_text' || type === undefined) && typeof block.text === 'string' && !looksImageLike) {
       parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: block.text });
       continue;
     }
-    if (type && type !== 'text' && type !== 'input_text' && type !== 'output_text') {
-      throw new ChatGptTranslationError(`unsupported content part type '${type}'`);
+    if (looksImageLike) {
+      throw new ChatGptTranslationError(`unsupported image-bearing content part type '${type ?? 'missing'}'`);
     }
+    throw new ChatGptTranslationError(`unsupported content part type '${type ?? 'missing'}'`);
   }
   return parts;
 }
@@ -205,6 +207,13 @@ export class ChatGptProvider extends BaseProvider {
 
     for (const m of messages) {
       if (m.role === 'system') {
+        if (Array.isArray(m.content) && m.content.some((raw) => {
+          if (typeof raw === 'string') return false;
+          const block = raw as Record<string, unknown>;
+          return block.type === 'image_url' || block.type === 'image' || block.type === 'input_image' || block.image_url != null || block.image != null || block.source != null;
+        })) {
+          throw new ChatGptTranslationError('images are supported only in user messages');
+        }
         const parts = responsesContentParts(m.content ?? '', 'user');
         const text = parts
           .filter((part): part is { type: 'input_text'; text: string } => part.type === 'input_text')
@@ -225,6 +234,12 @@ export class ChatGptProvider extends BaseProvider {
       }
       isInitialSystemPrefix = false;
       if (m.role === 'tool') {
+        if (Array.isArray(m.content)) {
+          responsesContentParts(m.content, 'user');
+          if (m.content.some((raw) => typeof raw !== 'string' && (raw as Record<string, unknown>).type === 'image_url')) {
+            throw new ChatGptTranslationError('images are supported only in user messages');
+          }
+        }
         input.push({
           type: 'function_call_output',
           call_id: m.tool_call_id ?? '',
@@ -449,7 +464,11 @@ export class ChatGptProvider extends BaseProvider {
     for (const item of json.output ?? []) {
       if (item.type === 'message') {
         for (const part of item.content ?? []) {
-          if (part.type === 'output_text' && typeof part.text === 'string') text += part.text;
+          if (part.type === 'output_text' && typeof part.text === 'string') {
+            text += part.text;
+          } else if (part.type?.includes('image')) {
+            throw new ChatGptTranslationError(`provider image output type '${part.type}' is not supported`);
+          }
         }
       } else if (item.type === 'function_call') {
         toolCalls.push({
@@ -531,6 +550,10 @@ export class ChatGptProvider extends BaseProvider {
         typeof evt.delta === 'string'
       ) {
         yield mkChunk({ reasoning_content: evt.delta }, null);
+      } else if (type === 'response.output_item.added' && evt.item?.type?.includes('image')) {
+        throw new ChatGptTranslationError(`provider image output type '${evt.item.type}' is not supported`);
+      } else if (type === 'response.output_item.added' && evt.item?.type === 'message' && evt.item.content?.some((part) => part.type?.includes('image'))) {
+        throw new ChatGptTranslationError('provider image output content is not supported');
       } else if (type === 'response.output_item.added' && evt.item?.type === 'function_call') {
         const outputIndex = typeof evt.output_index === 'number' ? evt.output_index : nextToolIndex;
         const toolIndex = nextToolIndex++;
@@ -661,7 +684,7 @@ interface ResponsesStreamEvent {
   type?: string;
   delta?: unknown;
   output_index?: number;
-  item?: { type?: string; id?: string; call_id?: string; name?: string };
+  item?: { type?: string; id?: string; call_id?: string; name?: string; content?: Array<{ type?: string }> };
   response?: { usage?: ResponsesUsage; error?: { message?: string } };
   error?: { message?: string };
   [key: string]: unknown;

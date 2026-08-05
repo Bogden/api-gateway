@@ -180,7 +180,34 @@ describe('ChatGptProvider', () => {
       role: 'user',
       content: [{ type: 'image_url', image_url: 'https://example.com/image.png' }],
     }], 'gpt-5', {}))).rejects.toThrow(/image_url parts must use the object shape/i);
+    await expect(collect(provider.streamChatCompletion('no-key', [{
+      role: 'user',
+      content: [{ image_url: { url: 'https://example.com/image.png' } }],
+    }], 'gpt-5', {}))).rejects.toThrow(/image-bearing.*missing/i);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects image blocks in system and tool messages before contacting Codex', async () => {
+    writeLogin();
+    const fetchSpy = vi.spyOn(global, 'fetch');
+    for (const message of [
+      { role: 'system', content: [{ type: 'image_url', image_url: { url: 'https://example.com/system.png' } }] },
+      { role: 'tool', tool_call_id: 'call_1', content: [{ type: 'image_url', image_url: { url: 'https://example.com/tool.png' } }] },
+    ] as any[]) {
+      await expect(collect(provider.streamChatCompletion('no-key', [message], 'gpt-5', {}))).rejects.toThrow(/user messages/i);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects provider-generated image output instead of returning an empty completion', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({ id: 'r', output: [{ type: 'message', content: [{ type: 'output_image', image_url: 'data:image/png;base64,AAAA' }] }] }),
+    } as any);
+    await expect(provider.chatCompletion('no-key', [{ role: 'user', content: 'draw' }], 'gpt-5', {})).rejects.toThrow(/provider image output/i);
   });
 
   it('remaps minimal reasoning effort to low on codex models, but not on other models', async () => {

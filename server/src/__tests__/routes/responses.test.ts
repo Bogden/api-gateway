@@ -90,7 +90,7 @@ describe('POST /v1/responses (#96)', () => {
       ] }],
     }, key);
     expect(status).toBe(200);
-    expect(mockRouteRequest).toHaveBeenCalledWith(expect.any(Number), undefined, undefined, true, false, undefined);
+    expect(mockRouteRequest).toHaveBeenCalledWith(expect.any(Number), undefined, undefined, true, false, undefined, { pinMode: false });
   });
 
   it('rejects image content in assistant messages', async () => {
@@ -160,6 +160,33 @@ describe('POST /v1/responses (#96)', () => {
     // the terminal event carries the assembled text
     const completed = text.split('event: response.completed')[1];
     expect(completed).toContain('"output_text":"Hello"');
+  });
+
+  it('pins an explicit Responses gpt model instead of ignoring it', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() {
+        return { id: 'c', object: 'chat.completion', created: 0, model: 'gpt-explicit', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } };
+      },
+      async *streamChatCompletion() { /* unused */ },
+    }));
+    const { status } = await post(app, '/v1/responses', { model: 'gpt-explicit', input: 'hi' }, key);
+    expect(status).toBe(200);
+    expect(mockRouteRequest).toHaveBeenCalledWith(expect.any(Number), undefined, expect.any(Number), false, false, undefined, { pinMode: true });
+  });
+
+  it('preserves a deterministic provider 400 instead of flattening it to 502', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() {
+        const err: any = new Error('translation rejected input');
+        err.status = 400;
+        err.retryable = false;
+        throw err;
+      },
+      async *streamChatCompletion() { /* unused */ },
+    }));
+    const { status, text } = await post(app, '/v1/responses', { input: 'hi' }, key);
+    expect(status).toBe(400);
+    expect(JSON.parse(text).error.type).toBe('invalid_request_error');
   });
 
   it('stream: tool-call deltas produce function_call events with assembled arguments', async () => {
