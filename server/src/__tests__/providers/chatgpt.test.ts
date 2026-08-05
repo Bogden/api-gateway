@@ -418,6 +418,43 @@ describe('ChatGptProvider', () => {
     expect(err500.status).toBe(500);
   });
 
+  it('rejects malformed stream JSON before emitting a successful terminal chunk', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValue(sseResponse([
+      'event: response.output_text.delta\ndata: {not-json}\n\n',
+    ]) as any);
+
+    let err: any;
+    try {
+      await collect(provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5'));
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err).toMatchObject({ status: 400, retryable: false });
+    expect(err.message).toMatch(/malformed JSON/i);
+  });
+
+  it('rejects malformed stream JSON after a text delta without a success terminator', async () => {
+    writeLogin();
+    vi.spyOn(global, 'fetch').mockResolvedValue(sseResponse([
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+      'event: response.output_text.delta\ndata: {not-json}\n\n',
+    ]) as any);
+
+    const chunks: ChatCompletionChunk[] = [];
+    let err: any;
+    try {
+      for await (const chunk of provider.streamChatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5')) chunks.push(chunk);
+    } catch (e) {
+      err = e;
+    }
+    expect(chunks.map((chunk) => chunk.choices[0]?.delta?.content).filter(Boolean)).toEqual(['partial']);
+    expect(chunks.some((chunk) => chunk.choices[0]?.finish_reason === 'stop')).toBe(false);
+    expect(err).toMatchObject({ status: 400, retryable: false });
+    expect(err.message).toMatch(/malformed JSON/i);
+  });
+
   it('streams a happy-path turn with a tool call and extracts usage', async () => {
     writeLogin();
     vi.spyOn(global, 'fetch').mockResolvedValue(

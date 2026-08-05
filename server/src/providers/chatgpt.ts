@@ -615,7 +615,9 @@ export class ChatGptProvider extends BaseProvider {
   // Parse the Responses SSE stream into typed event objects. The Responses API
   // frames events as `event: <name>` + one or more `data: <json>` lines
   // terminated by a blank line; every data payload also carries a `type` field,
-  // which is what we key on downstream. Malformed frames are skipped.
+  // which is what we key on downstream. Comments and blank keepalives are skipped,
+  // but malformed non-empty data payloads fail the request rather than producing
+  // an apparently successful partial completion.
   private async *readResponsesStream(
     res: Response,
     modelId: string,
@@ -722,7 +724,7 @@ function parseFrame(frame: string): ResponsesStreamEvent | null {
   try {
     return JSON.parse(data) as ResponsesStreamEvent;
   } catch {
-    return null;
+    throw new ChatGptTranslationError('received malformed JSON in an upstream response stream');
   }
 }
 
