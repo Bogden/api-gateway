@@ -145,6 +145,34 @@ describe('ChatGptProvider', () => {
     expect(capturedBody.top_p).toBe(0.9);
   });
 
+  it('preserves ordered text and image parts in the upstream Responses request', async () => {
+    writeLogin();
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return sseResponse([
+        'event: response.completed\\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\\n\\n',
+      ]);
+    });
+    await collect(provider.streamChatCompletion('no-key', [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'before' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+        { type: 'text', text: 'after' },
+        { type: 'image_url', image_url: { url: 'https://example.com/image.png' } },
+      ],
+    }], 'gpt-5', {}));
+    expect(capturedBody.input).toEqual([{
+      type: 'message', role: 'user', content: [
+        { type: 'input_text', text: 'before' },
+        { type: 'input_image', image_url: 'data:image/png;base64,AAAA' },
+        { type: 'input_text', text: 'after' },
+        { type: 'input_image', image_url: 'https://example.com/image.png' },
+      ],
+    }]);
+  });
+
   it('remaps minimal reasoning effort to low on codex models, but not on other models', async () => {
     writeLogin();
     const bodies: any[] = [];

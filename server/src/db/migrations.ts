@@ -63,6 +63,8 @@ export function migrateDbSchema(db: Database.Database) {
   migrateQuirksV1(db);
   migrateModelsV32CommandCode(db);
   migrateModelsV33NvidiaMinimaxM3(db);
+  migrateModelsV35ChatgptVision(db);
+
 }
 
 function createTables(db: Database.Database) {
@@ -2458,6 +2460,12 @@ function migrateModelsV32CommandCode(db: Database.Database) {
 // dashboard. Seed it here so every install gets it automatically. Mirrors the
 // M2.7 row's limits (40 RPM, shared credit budget, 196608 context). Runs every
 // boot via INSERT OR IGNORE; the fallback_config backfill mirrors V32. (#292)
+function migrateModelsV35ChatgptVision(db: Database.Database) {
+  // ChatGPT/Codex models accept Responses input_image parts. Keep the existing
+  // tools capability untouched while upgrading both provisioned and historical rows.
+  db.prepare("UPDATE models SET supports_vision = 1, supports_tools = 1 WHERE platform = 'chatgpt'").run();
+}
+
 function migrateModelsV33NvidiaMinimaxM3(db: Database.Database) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)

@@ -55,7 +55,7 @@ export function ensureChatgptModel(
     INSERT INTO models
       (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
        monthly_token_budget, context_window, enabled, supports_vision, supports_tools)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 1)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1)
   `).run(
     'chatgpt', modelId, `${modelId} (ChatGPT)`, 1, 5, 'Frontier',
     'ChatGPT subscription', 400000,
@@ -772,7 +772,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // rough per-image token cost so budget routing isn't skewed by content the
   // heuristic above (text-only) can't see.
   const hasImage = messageHasImage(messages);
-  if (hasImage && !hasEnabledVisionModel()) {
+  const pinsChatgpt = !!requestedModel && !isAutoModel(requestedModel) && /^(?:chatgpt\/)?gpt-/i.test(requestedModel.trim());
+  if (hasImage && !pinsChatgpt && !hasEnabledVisionModel()) {
     res.status(422).json({
       error: {
         message: 'This request includes an image, but no vision-capable model is enabled. Enable a vision model (e.g. Gemini 2.5 Flash, Llama 4 Scout) in the Fallback Chain.',
@@ -797,7 +798,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // deliberately not in the fallback chain that hasEnabledToolsModel() counts,
   // so exempt it from this cascade-only gate — the Claude Code fork always
   // sends tools.
-  const pinsChatgpt = !!requestedModel && !isAutoModel(requestedModel) && /^(?:chatgpt\/)?gpt-/i.test(requestedModel.trim());
   if (wantsTools && !pinsChatgpt && !hasEnabledToolsModel()) {
     res.status(422).json({
       error: {
@@ -1521,6 +1521,20 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
 
       if (isRetryableError(err)) {
+        // A pinned ChatGPT subscription has no legitimate fallback provider.
+        // Surface the provider rejection immediately rather than entering the
+        // generic recovery loop, which could otherwise obscure the exact pin.
+        if (isPinned && route.platform === 'chatgpt') {
+          const status = typeof err?.status === 'number' && err.status >= 400 ? err.status : 429;
+          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+          res.status(status).json({
+            error: {
+              message: `Pinned model error (${route.displayName}): ${safeError}`,
+              type: status === 429 ? 'rate_limit_error' : 'provider_error',
+            },
+          });
+          return;
+        }
         // Dead-turn errors (in-band error, empty completion, stream stall,
         // unparseable dialect): in-band error means the key WORKS but this
         // specific model can't handle the request. Skip the model, not the

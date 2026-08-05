@@ -92,10 +92,80 @@ interface ResponsesRequestBody {
   include: string[];
 }
 
+type ResponsesInputContentPart =
+  | { type: 'input_text' | 'output_text'; text: string }
+  | { type: 'input_image'; image_url: string };
+
 type ResponsesInputItem =
-  | { type: 'message'; role: 'user' | 'assistant'; content: Array<{ type: 'input_text' | 'output_text'; text: string }> }
+  | { type: 'message'; role: 'user' | 'assistant'; content: ResponsesInputContentPart[] }
   | { type: 'function_call'; call_id: string; name: string; arguments: string }
   | { type: 'function_call_output'; call_id: string; output: string };
+
+class ChatGptTranslationError extends Error {
+  readonly status = 400;
+  readonly retryable = false;
+
+  constructor(message: string) {
+    super(`ChatGPT Responses translation rejected input: ${message}`);
+    this.name = 'ChatGptTranslationError';
+  }
+}
+
+function imageUrlFromBlock(block: Record<string, unknown>): string {
+  const imageUrl = block.image_url;
+  if (!imageUrl || typeof imageUrl !== 'object' || Array.isArray(imageUrl)) {
+    throw new ChatGptTranslationError(
+      "image_url parts must use the object shape { image_url: { url: string } }",
+    );
+  }
+  const url = (imageUrl as { url?: unknown }).url;
+  if (typeof url !== 'string' || !url.trim() || (!url.startsWith('data:') && !/^https?:\/\//i.test(url))) {
+    throw new ChatGptTranslationError(
+      'image_url.url must be a non-empty data URL or http(s) URL',
+    );
+  }
+  return url;
+}
+
+function responsesContentParts(
+  content: ChatMessage['content'],
+  role: 'user' | 'assistant',
+): ResponsesInputContentPart[] {
+  if (typeof content === 'string') {
+    return [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: content }];
+  }
+  if (content == null) return [];
+
+  const parts: ResponsesInputContentPart[] = [];
+  for (const raw of content) {
+    if (typeof raw === 'string') {
+      parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: raw });
+      continue;
+    }
+    const block = raw as Record<string, unknown>;
+    const type = typeof block.type === 'string' ? block.type : undefined;
+    if (type === 'image_url') {
+      if (role !== 'user') {
+        throw new ChatGptTranslationError('images are supported only in user messages');
+      }
+      parts.push({ type: 'input_image', image_url: imageUrlFromBlock(block) });
+      continue;
+    }
+    if (type === 'image' || type === 'input_image') {
+      throw new ChatGptTranslationError(
+        'only image_url parts with image_url.url are supported for image input',
+      );
+    }
+    if ((type === 'text' || type === 'input_text' || type === 'output_text' || type === undefined) && typeof block.text === 'string') {
+      parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: block.text });
+      continue;
+    }
+    if (type && type !== 'text' && type !== 'input_text' && type !== 'output_text') {
+      throw new ChatGptTranslationError(`unsupported content part type '${type}'`);
+    }
+  }
+  return parts;
+}
 
 export class ChatGptProvider extends BaseProvider {
   readonly platform: Platform = 'chatgpt';
@@ -135,7 +205,11 @@ export class ChatGptProvider extends BaseProvider {
 
     for (const m of messages) {
       if (m.role === 'system') {
-        const text = contentToString(m.content ?? '');
+        const parts = responsesContentParts(m.content ?? '', 'user');
+        const text = parts
+          .filter((part): part is { type: 'input_text'; text: string } => part.type === 'input_text')
+          .map((part) => part.text)
+          .join('');
         if (text) {
           if (isInitialSystemPrefix) {
             systemParts.push(text);
@@ -159,9 +233,9 @@ export class ChatGptProvider extends BaseProvider {
         continue;
       }
       if (m.role === 'assistant') {
-        const text = contentToString(m.content ?? '');
-        if (text) {
-          input.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] });
+        const content = responsesContentParts(m.content ?? '', 'assistant');
+        if (content.length) {
+          input.push({ type: 'message', role: 'assistant', content });
         }
         for (const tc of m.tool_calls ?? []) {
           input.push({
@@ -173,12 +247,11 @@ export class ChatGptProvider extends BaseProvider {
         }
         continue;
       }
-      // user (and any other non-system role) → input_text message
-      input.push({
-        type: 'message',
-        role: 'user',
-        content: [{ type: 'input_text', text: contentToString(m.content ?? '') }],
-      });
+      // user (and any other non-system role) → Responses message parts.
+      const content = responsesContentParts(m.content ?? '', 'user');
+      if (content.length) {
+        input.push({ type: 'message', role: 'user', content });
+      }
     }
 
     const instructions = systemParts.join('\n\n') || DEFAULT_INSTRUCTIONS;

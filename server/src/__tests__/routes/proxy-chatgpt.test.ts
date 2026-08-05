@@ -9,6 +9,7 @@ import { _resetChatgptCooldowns } from '../../services/chatgpt-cooldown.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 import { setClaudeModelMap } from '../../services/anthropic-map.js';
 import { ensureChatgptModel } from '../../routes/proxy.js';
+import { migrateDbSchema } from '../../db/migrations.js';
 
 let dashToken = '';
 
@@ -80,6 +81,8 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
   beforeEach(async () => {
     const db = getDb();
     db.prepare('DELETE FROM api_keys').run();
+    db.prepare('DELETE FROM requests').run();
+    db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'chatgpt')").run();
     db.prepare("DELETE FROM models WHERE platform = 'chatgpt'").run();
     _resetChatgptCooldowns();
     // Register the keyless chatgpt provider (sentinel key, no key material).
@@ -140,6 +143,46 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
       WHERE m.platform = 'chatgpt' AND fc.enabled = 1
     `).get() as { n: number };
     expect(inChain.n).toBe(0);
+    const caps = getDb().prepare("SELECT supports_vision, supports_tools FROM models WHERE platform = 'chatgpt' AND model_id = ?").get('gpt-5-codex') as any;
+    expect(caps).toEqual({ supports_vision: 1, supports_tools: 1 });
+  });
+
+  it('upgrades an existing ChatGPT row through the normal migration refresh', () => {
+    const db = getDb();
+    db.prepare("UPDATE models SET supports_vision = 0, supports_tools = 1 WHERE platform = 'chatgpt' AND model_id = 'gpt-5-codex'").run();
+    migrateDbSchema(db);
+    const upgraded = db.prepare("SELECT supports_vision, supports_tools FROM models WHERE platform = 'chatgpt' AND model_id = ?").get('gpt-5-codex') as any;
+    expect(upgraded).toEqual({ supports_vision: 1, supports_tools: 1 });
+  });
+
+  it('forwards pinned ChatGPT image parts to Codex without fallback', async () => {
+    let capturedBody: any;
+    mockCodex((init) => {
+      capturedBody = JSON.parse(String((init as RequestInit).body));
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          id: 'resp_image',
+          output: [{ type: 'message', content: [{ type: 'output_text', text: 'seen' }] }],
+          usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 },
+        }),
+      } as any;
+    });
+    const res = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'gpt-5-codex',
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: 'what?' },
+        { type: 'image_url', image_url: { url: 'https://example.com/image.png' } },
+      ] }],
+      stream: false,
+    }, authHeaders());
+    expect(res.status).toBe(200);
+    expect(capturedBody.input[0].content).toEqual([
+      { type: 'input_text', text: 'what?' },
+      { type: 'input_image', image_url: 'https://example.com/image.png' },
+    ]);
   });
 
   it('maps cached input usage on a non-streaming Anthropic response', async () => {

@@ -19,7 +19,40 @@ describe('Responses → chat translation (#96)', () => {
     expect(msgs[1]).toEqual({ role: 'user', content: 'hi' });
   });
 
-  it('flattens message items with content parts and maps the developer role to system', () => {
+  it('preserves ordered text and image_url parts, including data and ordinary URLs', () => {
+    const msgs = toChatMessages({
+      input: [{ type: 'message', role: 'user', content: [
+        { type: 'input_text', text: 'before' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+        { type: 'input_text', text: 'after' },
+        { type: 'image_url', image_url: { url: 'https://example.com/image.png' } },
+      ] }],
+    } as any);
+    expect(msgs).toEqual([{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'before' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+        { type: 'text', text: 'after' },
+        { type: 'image_url', image_url: { url: 'https://example.com/image.png' } },
+      ],
+    }]);
+  });
+
+  it('maps assistant output_text while preserving function call and output paths', () => {
+    const msgs = toChatMessages({
+      input: [
+        { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'checking' }] },
+        { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call_1', output: 'sunny' },
+      ],
+    } as any);
+    expect(msgs[0]).toEqual({ role: 'assistant', content: 'checking' });
+    expect(msgs[1].tool_calls?.[0].id).toBe('call_1');
+    expect(msgs[2]).toEqual({ role: 'tool', tool_call_id: 'call_1', content: 'sunny' });
+  });
+
+  it('maps text-only message arrays and developer role to system', () => {
     const msgs = toChatMessages({
       input: [
         { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'sys' }] },
@@ -30,6 +63,12 @@ describe('Responses → chat translation (#96)', () => {
       { role: 'system', content: 'sys' },
       { role: 'user', content: 'ab' },
     ]);
+  });
+
+  it('rejects unsupported image shapes loudly', () => {
+    expect(() => toChatMessages({ input: [{ type: 'message', role: 'user', content: [
+      { type: 'image_url', image_url: 'https://example.com/image.png' },
+    ] }] } as any)).toThrow(/image_url/);
   });
 
   it('maps a function_call item to an assistant tool_call', () => {
