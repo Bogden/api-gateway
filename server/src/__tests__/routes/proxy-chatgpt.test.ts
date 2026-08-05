@@ -251,6 +251,28 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
     expect(logged).toEqual({ input_tokens: 4, output_tokens: 1, cache_read_input_tokens: 6 });
   });
 
+  it('does not fall back after a pinned ChatGPT provider failure', async () => {
+    let codexCalls = 0;
+    mockCodex(() => {
+      codexCalls++;
+      return {
+        ok: false,
+        status: 500,
+        headers: new Headers(),
+        text: async () => 'provider unavailable',
+      };
+    });
+
+    const res = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'gpt-5-codex',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    }, authHeaders());
+    expect(res.status).toBe(500);
+    expect(res.body.error.type).toBe('provider_error');
+    expect(codexCalls).toBe(1);
+  });
+
   it('returns a distinctive 429 and surfaces the cooldown on /api/health', async () => {
     let codexCalls = 0;
     mockCodex(() => {

@@ -7,9 +7,8 @@ import type {
   ChatToolCall,
   ChatToolDefinition,
   ChatToolChoice,
-  ChatContentBlock,
 } from '@api-gateway/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, hasEnabledVisionModel, type RouteResult } from '../services/router.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
@@ -21,30 +20,12 @@ import {
   extractApiToken,
   getStickyModel,
   setStickyModel,
-  ensureChatgptModel,
   logRequest,
 } from './proxy.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { attachClientAbort, isAbortError } from '../lib/abort.js';
 import { getGlobalRetryLimit } from '../services/router.js';
 import { publish } from '../services/events.js';
-import { getDb } from '../db/index.js';
-
-function responsesPreferredModel(model: string | undefined): { id: number; pinned: boolean } {
-  if (!model || model === 'auto') return { id: 0, pinned: false };
-  const db = getDb();
-  const slash = model.indexOf('/');
-  let row: { id: number } | undefined;
-  if (slash > 0) {
-    row = db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1')
-      .get(model.slice(0, slash), model.slice(slash + 1)) as { id: number } | undefined;
-  }
-  if (!row) row = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(model) as { id: number } | undefined;
-  if (!row) row = ensureChatgptModel(db, model);
-  if (!row) throw Object.assign(new Error(`Model '${model}' is not in the catalog.`), { status: 400 });
-  return { id: row.id, pinned: true };
-}
-
 
 export const responsesRouter = Router();
 
@@ -141,75 +122,31 @@ const responsesRequestSchema = z.object({
 
 type ResponsesRequest = z.infer<typeof responsesRequestSchema>;
 
-// Responses content parts → the internal OpenAI content envelope. Text and
-// images stay in their original order so vision-capable providers can preserve
-// the client's prompt exactly.
-function partsToContent(content: string | Array<{ type: string; text?: unknown; image_url?: unknown }>): ChatMessage['content'] {
+// Responses content parts → plain text. input_text / output_text both carry
+// `text`; other part types (images, etc.) are dropped (parity with the proxy).
+function partsToString(content: string | Array<{ type: string; text?: unknown }>): string {
   if (typeof content === 'string') return content;
-  const parts: ChatContentBlock[] = [];
-  for (const part of content) {
-    if (part.type === 'input_text' || part.type === 'output_text') {
-      if (typeof part.text === 'string') parts.push({ type: 'text', text: part.text });
-      continue;
-    }
-    if (part.type === 'image_url') {
-      const imageUrl = part.image_url;
-      if (!imageUrl || typeof imageUrl !== 'object' || Array.isArray(imageUrl) || typeof (imageUrl as { url?: unknown }).url !== 'string') {
-        throw new Error('unsupported image_url shape: expected { image_url: { url: string } }');
-      }
-      parts.push({ type: 'image_url', image_url: { url: (imageUrl as { url: string }).url } });
-      continue;
-    }
-    if (part.type === 'input_image') {
-      throw new Error('unsupported Responses image shape: use image_url with { url: string }');
-    }
-    throw new Error(`unsupported Responses content part type '${part.type}'`);
-  }
-  const hasImage = parts.some((part) => typeof part !== 'string' && part.type === 'image_url');
-  return hasImage ? parts : parts.map((part) => typeof part === 'string' ? part : part.text ?? '').join('');
+  return content
+    .map((p) => (typeof p.text === 'string' ? p.text : ''))
+    .join('');
 }
 
-function partsToString(content: string | Array<{ type: string; text?: unknown; image_url?: unknown }>): string {
-  const converted = partsToContent(content);
-  return contentToString(converted);
-}
-
-// Identify whether a Responses request contains an image part, for vision
-// routing. Validation and conversion below still reject malformed shapes loudly.
+// Image input via the Responses API isn't carried through translation yet
+// (partsToString flattens to text). Detect it so we can hard-fail with a clear
+// pointer to /v1/chat/completions rather than silently dropping the image
+// (#118, #125). Recognizes the Responses `input_image` part plus the
+// chat-style `image_url` / `image` parts some clients reuse here.
 export function responsesInputHasImage(req: ResponsesRequest): boolean {
   if (typeof req.input === 'string') return false;
-  return req.input.some((item) => {
-    const content = (item as { content?: unknown }).content;
-    return Array.isArray(content) && content.some((part) => {
-      const type = (part as { type?: unknown })?.type;
-      return type === 'input_image' || type === 'image_url';
-    });
-  });
-}
-
-function validateResponsesImages(req: ResponsesRequest): void {
-  if (typeof req.input === 'string') return;
   for (const item of req.input) {
     const content = (item as { content?: unknown }).content;
     if (!Array.isArray(content)) continue;
-    // Run conversion solely for validation; the actual conversion happens once
-    // in toChatMessages so malformed image forms cannot be silently discarded.
-    partsToContent(content as any);
+    if (content.some((p) => {
+      const type = (p as { type?: string })?.type;
+      return type === 'input_image' || type === 'image_url' || type === 'image';
+    })) return true;
   }
-}
-
-function pinnedChatgptRequest(req: ResponsesRequest): boolean {
-  return !!req.model && /^(?:chatgpt\/)?gpt-/i.test(req.model.trim());
-}
-
-function imageInputError(message: string): { error: { message: string; type: string; code: string } } {
-  return {
-    error: {
-      message: `Unsupported Responses image input: ${message}`,
-      type: 'invalid_request_error',
-      code: 'unsupported_image_input',
-    },
-  };
+  return false;
 }
 
 // ── Translate a Responses request → internal chat messages + options ──────
@@ -248,7 +185,7 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
       const m = item as z.infer<typeof messageItemSchema>;
       // 'developer' is the Responses-era system role.
       const role = m.role === 'developer' ? 'system' : m.role;
-      messages.push({ role, content: partsToContent(m.content) });
+      messages.push({ role, content: partsToString(m.content) });
     }
   }
 
@@ -350,26 +287,21 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
   const reqData = parsed.data;
 
-  try {
-    validateResponsesImages(reqData);
-  } catch (err: any) {
-    res.status(400).json(imageInputError(err.message));
-    return;
-  }
-
-  const stream = reqData.stream ?? false;
-  const messages = toChatMessages(reqData);
-  const hasImage = responsesInputHasImage(reqData);
-  if (hasImage && !pinnedChatgptRequest(reqData) && !hasEnabledVisionModel()) {
+  // Vision isn't carried through the Responses translation yet — fail clearly
+  // instead of answering blind to a dropped image (#118, #125).
+  if (responsesInputHasImage(reqData)) {
     res.status(422).json({
       error: {
-        message: 'This request includes an image, but no vision-capable model is enabled. Enable a vision model in the Fallback Chain or pin a ChatGPT gpt-* model.',
+        message: 'Image input is not yet supported on /v1/responses. Use /v1/chat/completions with an image_url content part instead.',
         type: 'invalid_request_error',
         code: 'no_vision_model',
       },
     });
     return;
   }
+
+  const stream = reqData.stream ?? false;
+  const messages = toChatMessages(reqData);
   const tools = toChatTools(reqData.tools);
   // name → parameter schema, for repairing double-encoded tool arguments on
   // the way back out (see lib/tool-args.ts).
@@ -395,10 +327,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // Optional client-managed session affinity (mirrors /chat/completions).
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
-  const requestedRoute = responsesPreferredModel(reqData.model);
-  const preferredModel = requestedRoute.pinned
-    ? requestedRoute.id
-    : getStickyModel(extractApiToken(req), messages, sessionIdHeader);
+  const preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
 
   // Tool-bearing requests (the normal case for Codex/agent clients on this
   // endpoint) must stay on models that emit structured tool_calls — a model
@@ -450,13 +379,9 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     }
     // ---- Exit: upstream attempt cap reached ----
     if (upstreamAttempts >= attemptLimit) break;
-    let route: RouteResult | undefined;
+    let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage, wantsTools, skipModels.size > 0 ? skipModels : undefined, { pinMode: requestedRoute.pinned });
-      if (requestedRoute.pinned && route.modelDbId !== preferredModel) {
-        route.release();
-        throw Object.assign(new Error('Pinned model routing selected a different model.'), { status: 502 });
-      }
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools, skipModels.size > 0 ? skipModels : undefined);
     } catch (err: any) {
       const status = lastError ? 429 : (err.status ?? 503);
       const message = lastError
@@ -761,10 +686,6 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
       const latency = Date.now() - start;
       const safeError = sanitizeProviderErrorMessage(err.message);
-      if (!route) {
-        if (!res.headersSent) res.status(err.status ?? 502).json({ error: { message: safeError, type: 'provider_error' } });
-        return;
-      }
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
 
       // Mid-stream failures can't be retried (bytes already sent) — close cleanly.
@@ -789,7 +710,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       res.status(502).json({ error: { message: `Provider error (${route.displayName}): ${safeError}`, type: 'provider_error' } });
       return;
     } finally {
-      route?.release();
+      route.release();
     }
   }
 

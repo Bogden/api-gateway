@@ -173,6 +173,16 @@ describe('ChatGptProvider', () => {
     }]);
   });
 
+  it('rejects unsupported image shapes before contacting Codex', async () => {
+    writeLogin();
+    const fetchSpy = vi.spyOn(global, 'fetch');
+    await expect(collect(provider.streamChatCompletion('no-key', [{
+      role: 'user',
+      content: [{ type: 'image_url', image_url: 'https://example.com/image.png' }],
+    }], 'gpt-5', {}))).rejects.toThrow(/image_url parts must use the object shape/i);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it('remaps minimal reasoning effort to low on codex models, but not on other models', async () => {
     writeLogin();
     const bodies: any[] = [];

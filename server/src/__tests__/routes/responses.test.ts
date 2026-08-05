@@ -51,9 +51,9 @@ describe('POST /v1/responses (#96)', () => {
     expect((await post(app, '/v1/responses', { model: 'auto' }, key)).status).toBe(400);
   });
 
-  // Unsupported legacy image forms must fail loudly rather than silently
-  // dropping the image.
-  it('rejects unsupported image input with a clear 400', async () => {
+  // #118: image input isn't carried through the Responses translation yet, so
+  // it must hard-fail clearly rather than silently answer blind to the image.
+  it('rejects image input with a clear 422 pointing at /v1/chat/completions', async () => {
     const { status, text } = await post(app, '/v1/responses', {
       input: [{
         role: 'user',
@@ -63,8 +63,8 @@ describe('POST /v1/responses (#96)', () => {
         ],
       }],
     }, key);
-    expect(status).toBe(400);
-    expect(JSON.parse(text).error.code).toBe('unsupported_image_input');
+    expect(status).toBe(422);
+    expect(JSON.parse(text).error.code).toBe('no_vision_model');
   });
 
   // #103: the x-api-key header (Anthropic wire format) must authenticate here
