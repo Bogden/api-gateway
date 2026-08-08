@@ -11,7 +11,7 @@ import type {
 } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, hasEnabledVisionModel, type RouteResult } from '../services/router.js';
 import { recordRequest, recordFailedRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
-import { attemptReachedProvider, providerAtFault, isRetryableError, isPaymentRequiredError } from '../lib/error-classify.js';
+import { attemptConsumedQuota, providerAtFault, isRetryableError, isPaymentRequiredError } from '../lib/error-classify.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -830,8 +830,11 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
 
       // Failed attempts count against the provider's quota too — see
-      // recordFailedRequest. Skipped when nothing reached the provider.
-      if (attemptReachedProvider(err)) {
+      // recordFailedRequest. Skipped when nothing reached the provider, and
+      // also when the provider REFUSED the request rather than serving it
+      // (429/402/403/401): billing a refusal moves the daily counter that
+      // decides a 24h quarantine. Backing off is the cooldown's job below.
+      if (attemptConsumedQuota(err)) {
         recordFailedRequest(route.platform, route.modelId, route.keyId);
       }
 

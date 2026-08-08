@@ -12,6 +12,15 @@ import type { Express } from 'express';
 //     once per RETRY, so a retrying request handed back more slots than it
 //     took and stole capacity from concurrent requests. The /v1/messages route
 //     had the mirror-image bug: it claimed a slot and never released it.
+//  3. the first cut of (1) billed too broadly: it charged any attempt that
+//     REACHED the provider, including ones the provider REFUSED at the gate
+//     (429/402/403/401) rather than served. With PER_KEY_RETRIES attempts per
+//     request, one refused request moved the daily counter three times — and
+//     that counter is what promotes a 90s rest onto the 2m→10m→1h→24h ladder,
+//     so a key could be quarantined for a day on usage that never happened.
+//     It also under-billed: /v1/messages rethrows a mid-stream death as an
+//     empty wrapper class carrying no status, so the one route that had
+//     certainly spent quota recorded nothing. (card c4406)
 
 const chatCompletion = vi.fn();
 const streamChatCompletion = vi.fn();
@@ -32,7 +41,7 @@ const { initDb, getDb, getUnifiedApiKey } = await import('../../db/index.js');
 const { encrypt } = await import('../../lib/crypto.js');
 const { setRoutingStrategy, setGlobalRetryLimit, routeRequest, getInFlightCount } =
   await import('../../services/router.js');
-const { providerDailyRequestCount, clearPlatformCaches } = await import('../../services/ratelimit.js');
+const { providerDailyRequestCount, clearPlatformCaches, isOnCooldown } = await import('../../services/ratelimit.js');
 const { clearExhausted } = await import('../../services/key-exhaustion.js');
 
 const PLATFORM = 'flaky';
@@ -59,6 +68,13 @@ async function post(app: Express, path: string, body: any, key: string) {
 const RATE_LIMITED = Object.assign(
   new Error('flaky API error 429: too many requests'),
   { status: 429 },
+);
+// A provider that accepted the request and broke trying to serve it. Same
+// shape, but it SPENT the quota — a 429 is the provider declining to do the
+// work, a 500 is the provider doing it badly.
+const SERVER_ERROR = Object.assign(
+  new Error('flaky API error 500: internal server error'),
+  { status: 500 },
 );
 const GOOD_RESULT = {
   choices: [{ message: { role: 'assistant', content: 'ok' } }],
@@ -113,20 +129,20 @@ describe('Usage limiter accounting under failure and retry', () => {
     setGlobalRetryLimit(3);          // bounds the loop: 3 upstream attempts, no 1-RPM sleeps
   });
 
-  // ── Defect 1: the ledger must move on failed attempts ──
-  it('counts attempts that reached the provider even when every one is rejected', async () => {
-    chatCompletion.mockRejectedValue(RATE_LIMITED);
+  // ── Defect 1: the ledger must move on failed attempts the provider SERVED ──
+  it('counts attempts the provider served, even when every one failed', async () => {
+    chatCompletion.mockRejectedValue(SERVER_ERROR);
 
     const { status } = await post(app, '/v1/chat/completions', {
       messages: [{ role: 'user', content: 'hi' }],
     }, key);
 
-    expect(status).toBe(429);
+    expect(status).toBeGreaterThanOrEqual(400);
     expect(chatCompletion).toHaveBeenCalledTimes(3);
-    // Every one of those three attempts was accepted and rejected by the
-    // provider, so all three count against its request quota. Recording only
-    // successes left this at 0 — the limiter saw a completely idle key while
-    // the gateway hammered a provider that was already saying no.
+    // The provider accepted all three and broke serving them, so all three
+    // count against its request quota. Recording only successes left this at
+    // 0 — the limiter saw a completely idle key while the gateway hammered a
+    // provider that was already failing.
     expect(providerDailyRequestCount(PLATFORM, keyId)).toBe(3);
   });
 
@@ -141,6 +157,48 @@ describe('Usage limiter accounting under failure and retry', () => {
 
     expect(chatCompletion).toHaveBeenCalledTimes(3);
     expect(providerDailyRequestCount(PLATFORM, keyId)).toBe(0);
+  });
+
+  // ── Defect 3: a REFUSAL is not a purchase ──
+  it('does not bill a 429, but still rests the key for it', async () => {
+    chatCompletion.mockRejectedValue(RATE_LIMITED);
+
+    const { status } = await post(app, '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'hi' }],
+    }, key);
+
+    expect(status).toBe(429);
+    expect(chatCompletion).toHaveBeenCalledTimes(3);
+    // The provider declined to do the work because we were over a limit — it
+    // did not spend the account's daily quota on our behalf. Billing it moved
+    // this counter by 3 for ONE refused request, and this counter is what
+    // getCooldownDurationForLimit reads to call a 429 "daily exhaustion" and
+    // promote a 90s rest onto the ladder that ends at 24h.
+    expect(providerDailyRequestCount(PLATFORM, keyId)).toBe(0);
+    // Crucially the back-off itself is untouched: not billing a refusal must
+    // not mean ignoring it. That is the cooldown's job, and it still happens.
+    expect(isOnCooldown(PLATFORM, MODEL_ID, keyId)).toBe(true);
+  });
+
+  it('bills a /v1/messages turn that died after the provider streamed real bytes', async () => {
+    // The route rethrows a mid-stream death as an empty wrapper class with no
+    // status and no message, so the shape heuristics read it as "never reached
+    // the provider" and charged nothing — while the chat route charges the
+    // identical failure. The provider had already streamed payload here.
+    streamChatCompletion.mockImplementation(async function* () {
+      yield { choices: [{ delta: { content: 'partial' } }] };
+      throw new Error('socket hang up mid-stream');
+    });
+
+    await post(app, '/v1/messages', {
+      model: 'claude-sonnet-4-5',
+      max_tokens: 64,
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, key);
+
+    expect(streamChatCompletion).toHaveBeenCalledTimes(1);
+    expect(providerDailyRequestCount(PLATFORM, keyId)).toBe(1);
   });
 
   // ── Defect 2: claim/release symmetry across a RETRYING request ──

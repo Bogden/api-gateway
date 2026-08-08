@@ -133,6 +133,23 @@ export function isRetryableError(err: any): boolean {
  *  only after the request was dispatched, so the provider has it. */
 export function attemptReachedProvider(err: any): boolean {
   if (!err) return false;
+  // Explicit marker from the thrower, honored ahead of every heuristic below.
+  // The heuristics read an error's SHAPE to infer whether an HTTP round trip
+  // happened, and two classes of error are shaped misleadingly:
+  //   * locally-synthesized failures that carry a real-looking status they
+  //     never got from a provider — our own ChatGPT plan cooldown is a 429
+  //     thrown SPECIFICALLY to avoid dispatching, and the Responses
+  //     translation rejection is a 400 thrown while building the request. Both
+  //     used to be charged the account's quota for a call that never left the
+  //     box, and the cooldown one is charged hardest exactly while a plan is
+  //     already throttled.
+  //   * dead-turn wrappers that carry NO status although the provider streamed
+  //     real bytes — /v1/messages rethrows mid-stream deaths as an empty
+  //     marker class, so the one route that had genuinely spent quota was the
+  //     one route that recorded nothing.
+  // Neither is distinguishable from the outside, so the thrower states it.
+  // (card c4406)
+  if (typeof err.reachedProvider === 'boolean') return err.reachedProvider;
   if (typeof err.status === 'number' && err.status >= 400) return true;
   if (err.name === 'ProviderTimeoutError') return true;
   const msg = (err.message ?? '').toLowerCase();
@@ -142,6 +159,42 @@ export function attemptReachedProvider(err: any): boolean {
     || msg.includes('stream ended unexpectedly')
     || msg.includes('stream stalled')
     || msg.includes('unparseable inline tool-call dialect');
+}
+
+/** Did this attempt actually SPEND the account's request quota, such that the
+ *  rate limiter's rpm/rpd windows and the provider-wide daily cap must move?
+ *  The fourth question in this file, and the only one that may gate
+ *  `recordFailedRequest`.
+ *
+ *  A strict subset of `attemptReachedProvider`: reaching the provider is
+ *  necessary but not sufficient. The gap is the set of statuses where the
+ *  provider REFUSED the request at the gate rather than serving it —
+ *    429  we are over a limit, so it declined to do the work,
+ *    402  the account is out of credits,
+ *    403  this key's tier may not have this model,
+ *    401  the credential was rejected before anything ran.
+ *  Most free tiers do not bill a refusal against the daily quota, and charging
+ *  them is actively harmful rather than merely imprecise: the retry loop makes
+ *  PER_KEY_RETRIES attempts, so ONE refused request moved the daily counter by
+ *  three. That counter is what `getCooldownDurationForLimit` reads to decide a
+ *  429 is a DAILY exhaustion rather than a transient one, which promotes the
+ *  bench from a 90s rest onto the 2m→10m→1h→24h ladder, and it is what
+ *  `canUseProvider` reads to skip every model on the provider. A key could be
+ *  quarantined for a day on usage the provider never charged. (card c4406)
+ *
+ *  Excluding refusals does NOT reopen the blindness this accounting was added
+ *  to fix — "stop sending to this key" is the cooldown's job, and a 429 still
+ *  sets one via `providerAtFault`. This predicate only decides whether the
+ *  attempt is billed, not whether we back off.
+ *
+ *  Everything the provider DID serve still counts: a 5xx (it tried and broke),
+ *  a 400/422 (it parsed our request and rejected the content), a 404/410 (it
+ *  resolved the route), our own dispatch deadline (it has the request), and any
+ *  dead turn off a 200 (it streamed). Those spend quota exactly like a success. */
+export function attemptConsumedQuota(err: any): boolean {
+  if (!attemptReachedProvider(err)) return false;
+  const status = effectiveStatus(err);
+  return !(status === 401 || status === 402 || status === 403 || status === 429);
 }
 
 /** Is this failure attributable to the PROVIDER — its rate limit, its quota

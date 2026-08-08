@@ -19,7 +19,7 @@ import { getDb } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
-import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, attemptReachedProvider, providerAtFault } from '../lib/error-classify.js';
+import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, attemptConsumedQuota, providerAtFault } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, isAuthorizedV1Request, getStickyModel, setStickyModel } from './proxy.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
@@ -470,8 +470,11 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, safeError, null, pinnedModelId);
 
       // Failed attempts count against the provider's quota too — see
-      // recordFailedRequest. Skipped when nothing reached the provider.
-      if (attemptReachedProvider(err)) {
+      // recordFailedRequest. Skipped when nothing reached the provider, and
+      // also when the provider REFUSED the request rather than serving it
+      // (429/402/403/401): billing a refusal moves the daily counter that
+      // decides a 24h quarantine. Backing off is the cooldown's job below.
+      if (attemptConsumedQuota(err)) {
         recordFailedRequest(route.platform, route.modelId, route.keyId);
       }
 
@@ -515,7 +518,16 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
 // Thrown by streamCompletion once the SSE response is underway, so the outer
 // loop knows the request is finished (honestly errored mid-stream) and must
 // not fail over or send a second response.
-class StreamAlreadyStarted extends Error {}
+class StreamAlreadyStarted extends Error {
+  // Both throw sites are gated on `messageStarted`, so the provider accepted
+  // the request and streamed real payload before the turn died — fully charged
+  // against its quota, exactly like the chat route's mid-stream death. This
+  // wrapper carries no status and no message, so without the marker the
+  // limiter's shape heuristics read it as "never reached the provider" and
+  // this route recorded nothing for the one failure it had certainly paid
+  // for. (card c4406)
+  readonly reachedProvider = true;
+}
 
 interface StreamCtx {
   start: number;
