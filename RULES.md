@@ -14,10 +14,18 @@
 
 ## 0. Repository Identity
 
-| Role | URL |
-|---|---|
-| **Your fork** (origin) | `https://github.com/MLuqmanBR/api-gateway.git` |
-| **Upstream** (original) | `https://github.com/tashfeenahmed/freellmapi.git` |
+> ⚠️ **The table below described the checkout this document was INHERITED from, not this
+> one.** In this checkout `origin` is `Bogden/api-gateway` and `MLuqmanBR/api-gateway` is
+> the `upstream` remote — a stranger's repository. Acting on the old table means pushing
+> our work to someone else's fork. The corrected identity, and the `gh pr create` targeting
+> rule that follows from it, are in [CLAUDE.md](CLAUDE.md) § "Repository identity"; that
+> section is binding and this one is background.
+
+| Role | URL | In this checkout |
+|---|---|---|
+| **Our fork** (`origin`) | `https://github.com/Bogden/api-gateway.git` | the only push target |
+| **Mid-chain fork** (`upstream`) | `https://github.com/MLuqmanBR/api-gateway.git` | not ours |
+| **Upstream** (original) | `https://github.com/tashfeenahmed/freellmapi.git` | not ours |
 
 ```
 upstream/main  ←  the canonical upstream. Never commit here directly.
