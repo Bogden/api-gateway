@@ -10,13 +10,12 @@ import type {
   ChatContentBlock,
 } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, hasEnabledVisionModel, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
+import { recordRequest, recordFailedRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
+import { attemptReachedProvider, providerAtFault, isRetryableError, isPaymentRequiredError } from '../lib/error-classify.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import {
-  isRetryableError,
-  isPaymentRequiredError,
   isAuthorizedV1Request,
   ensureChatgptModel,
   extractApiToken,
@@ -830,6 +829,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
 
+      // Failed attempts count against the provider's quota too — see
+      // recordFailedRequest. Skipped when nothing reached the provider.
+      if (attemptReachedProvider(err)) {
+        recordFailedRequest(route.platform, route.modelId, route.keyId);
+      }
+
       // Mid-stream failures can't be retried (bytes already sent) — close cleanly.
       if (stream && streamStarted) {
         sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } } });
@@ -839,11 +844,19 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
       if (isRetryableError(err)) {
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(
-          isPaymentRequiredError(err),
-          route.platform, route.modelId, route.keyId,
-          { rpd: route.rpdLimit, tpd: route.tpdLimit },
-        ));
+        // Fail over on any retryable error, but only REST the key when the
+        // provider is the one at fault. This used to key off isRetryableError,
+        // which says yes to `fetch failed` — so a total local network outage
+        // benched every key the chain touched, each for a persisted 90s, for a
+        // fault entirely on our side of the wire. skipKeys above still rotates
+        // away from this route for the rest of this request either way.
+        if (providerAtFault(err)) {
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(
+            isPaymentRequiredError(err),
+            route.platform, route.modelId, route.keyId,
+            { rpd: route.rpdLimit, tpd: route.tpdLimit },
+          ));
+        }
         recordRateLimitHit(route.modelDbId);
         lastError = err;
         continue;

@@ -5,7 +5,8 @@ import { z } from 'zod';
 import type { ChatMessage, ModelListRow } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
 import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
-import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
+import { recordRequest, recordFailedRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
+import { attemptReachedProvider, providerAtFault, isRetryableError, isPaymentRequiredError } from '../lib/error-classify.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
@@ -500,65 +501,16 @@ const chatCompletionSchema = z.object({
   // other provider ignores it. (card c3025)
   prompt_cache_key: z.string().nullable().optional(),
 });
-export function isRetryableError(err: any): boolean {
-  // Explicit provider opt-out: a deterministic upstream failure (e.g. a 400/422
-  // validation rejection) that will fail identically on every attempt. Honored
-  // before the message-based heuristics below so such errors fail fast and are
-  // passed through rather than consuming the recovery budget. (card c1881)
-  if (err?.retryable === false) return false;
-  const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
-    || msg.includes('quota') || msg.includes('resource_exhausted')
-    || msg.includes('aborted') || msg.includes('timeout') || msg.includes('etimedout')
-    || msg.includes('econnrefused') || msg.includes('econnreset')
-    || msg.includes('503') || msg.includes('unavailable')
-    || msg.includes('500') || msg.includes('internal server error')
-    // 413: this model's payload limit is too small for the request, but another
-    // provider in the fallback chain may have a larger limit. Same reasoning as 503.
-    || msg.includes('413') || msg.includes('payload too large') || msg.includes('request body too large')
-    || msg.includes('request entity too large') || msg.includes('content too large')
-    // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
-    // for a model that's been pulled). Rotate to the next model in the chain —
-    // setCooldown + the health checker will avoid this model on subsequent requests.
-    || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
-    // 403: the key is valid (passed validateKey, health checker disables
-    // truly-forbidden keys) but this specific model is off-limits to the
-    // key's tier. The normal retry path exhausts this key after
-    // PER_KEY_RETRIES, marks it exhausted, and rotates to a sibling key
-    // on the same model; if no siblings survive, the outer loop moves to
-    // the next model. Cooldown uses the standard computeRetryCooldownMs
-    // — no special day-long bench. See issue #256.
-    || msg.includes('403') || msg.includes('forbidden') || (err?.status === 403)
-    // 400: one provider may reject parameters another accepts (e.g. max_tokens
-    // limits, unsupported params). The matching pattern is "api error 400"
-    // which comes from the OpenAI-compat provider's error formatting, not
-    // a bare "400" which is deliberately non-retryable for validation errors.
-    || msg.includes('api error 400')
-    // 402: this provider/key is out of credits (e.g. HuggingFace Router
-    // "API error 402: Payment required"). The SAME model often lives on another
-    // provider (Kimi K2.6 is on HF + Cloudflare + NVIDIA), so fail over instead
-    // of killing the workflow. Paired with a long cooldown (isPaymentRequiredError)
-    // so we don't re-hammer the broke key every retry.
-    || isPaymentRequiredError(err)
-    // Dead-turn classes from the stream turn-integrity layer (#231 audit):
-    // all thrown before any byte reached the client, so another model can
-    // serve the request invisibly.
-    || msg.includes('empty completion')
-    || msg.includes('in-band provider error')
-    || msg.includes('stream ended unexpectedly')
-    || msg.includes('stream stalled')
-    || msg.includes('unparseable inline tool-call dialect');
-}
-
-// A 402 Payment Required / out-of-credits error. Distinct from a transient 429:
-// it won't recover on the next window, so the caller benches the model+key with
-// PAYMENT_REQUIRED_COOLDOWN_MS (a full day) rather than the 90s transient cooldown.
-export function isPaymentRequiredError(err: any): boolean {
-  const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('402') || msg.includes('payment required')
-    || msg.includes('insufficient_quota') || msg.includes('insufficient credit')
-    || msg.includes('insufficient balance');
-}
+// `isRetryableError` and `isPaymentRequiredError` used to be defined here as
+// well as in lib/error-classify.ts, and the two copies had drifted: this one
+// never learned to trust the adapter's structured `err.status` (so an upstream
+// 502/504/507 or a bare 409/410 fell through to a client-facing 502, stranding
+// the healthy routes still queued behind it) nor to match undici's `fetch
+// failed`, while the lib copy never learned the provider's explicit
+// `retryable:false` opt-out. "Should I fail over?" therefore got a different
+// answer depending on whether the client spoke /v1/chat/completions or
+// /v1/messages. Both classifiers now live in lib/error-classify.ts only; the
+// imports are at the top of this file.
 
 // Pull the incremental text out of a streaming chunk for token counting.
 // Must tolerate chunks that carry no `choices` array at all: some providers
@@ -1105,7 +1057,18 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       || routeModelIdLower.includes('minimaxai/minimax-m');
 
     // ---- Per-key retry: up to PER_KEY_RETRIES immediate attempts ----
+    // One reservation, one release: `routeRequest` reserved this provider's
+    // in-flight slot once, and this try/finally owns it for the WHOLE per-key
+    // retry cycle. The release used to sit in a `finally` INSIDE the loop, so a
+    // retrying request released a slot per attempt against a single
+    // reservation — driving the provider's in-flight counter below its true
+    // value, stealing capacity from concurrent requests and letting real
+    // concurrency exceed maxParallelRequests. Every exit (success, non-
+    // retryable error, `continue outerLoop`, key exhaustion, or a thrown
+    // exception) unwinds through this finally exactly once; `release` is itself
+    // one-shot, so a double call can never decrement twice.
     let keySucceeded = false;
+    try {
     keyRetry: for (let keyAttempt = 0; keyAttempt < PER_KEY_RETRIES; keyAttempt++) {
       try {
       if (stream) {
@@ -1393,6 +1356,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
             logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), null, pinnedModelId);
+            // The provider answered and streamed real payload before dying —
+            // fully charged against its request quota, so the limiter counts it.
+            recordFailedRequest(route.platform, route.modelId, route.keyId);
             recordRateLimitHit(route.modelDbId);
             return;
           }
@@ -1519,6 +1485,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       const safeError = sanitizeProviderErrorMessage(err.message);
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
 
+      // Charge the attempt to the limiter even though it failed. The ledger
+      // used to move only on success, so a provider that started rejecting us
+      // froze the rpm/rpd counters and the provider-wide daily cap — the
+      // limiter went blind (and kept routing) exactly when it needed to back
+      // off. Gated so a failure that never reached the provider (transport
+      // death; client aborts already returned above) isn't charged to it.
+      if (attemptReachedProvider(err)) {
+        recordFailedRequest(route.platform, route.modelId, route.keyId);
+      }
 
       if (isRetryableError(err)) {
         // A pinned ChatGPT subscription has no legitimate fallback provider.
@@ -1593,10 +1568,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         });
         return;
       }
+    }
+    } // end keyRetry
     } finally {
       route.release();
     }
-    } // end keyRetry
 
     // Key exhausted: all PER_KEY_RETRIES attempts failed.
     // Mark it so the router cycles to the next key (and in 1 RPM mode,
@@ -1604,17 +1580,28 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     markExhausted(route.keyId, route.platform, route.modelId);
     const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
     skipKeys.add(skipId);
-    setCooldown(
-      route.platform,
-      route.modelId,
-      route.keyId,
-      computeRetryCooldownMs(
-        isPaymentRequiredError(lastError),
-        route.platform, route.modelId, route.keyId,
-        { rpd: route.rpdLimit, tpd: route.tpdLimit },
-        lastError?.retryAfterMs,
-      ),
-    );
+    // Exhausting the per-key retries says this key isn't working RIGHT NOW; it
+    // does not say the key deserves a persisted rest. This bench was ungated,
+    // so a total local network outage — every attempt dying as `fetch failed`
+    // before it left the box — walked the chain and left every key it touched
+    // benched, unroutable (router.ts:700) even after the network came back.
+    // markExhausted + skipKeys above still rotate to the next key regardless;
+    // only the cross-request bench is now conditional on the provider being at
+    // fault. Reached here only for retryable errors — a non-retryable one
+    // returns to the client above without exhausting the key.
+    if (providerAtFault(lastError)) {
+      setCooldown(
+        route.platform,
+        route.modelId,
+        route.keyId,
+        computeRetryCooldownMs(
+          isPaymentRequiredError(lastError),
+          route.platform, route.modelId, route.keyId,
+          { rpd: route.rpdLimit, tpd: route.tpdLimit },
+          lastError?.retryAfterMs,
+        ),
+      );
+    }
     recordRateLimitHit(route.modelDbId);
     lastRequestTime = Date.now();
     publish({ type: 'routing.key_exhausted', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, reason: sanitizeProviderErrorMessage(lastError?.message), at: Date.now() });

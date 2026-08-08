@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { isRetryableError, isPaymentRequiredError } from '../../routes/proxy.js';
+// Both classifiers now live in lib/error-classify.ts only — routes/proxy.ts
+// used to carry a second, drifted copy. See error-classify-retryable.test.ts.
+import { isRetryableError, isPaymentRequiredError } from '../../lib/error-classify.js';
+import { ProviderTimeoutError } from '../../providers/base.js';
 
 describe('isRetryableError', () => {
   describe('413 Payload Too Large', () => {
@@ -123,6 +126,25 @@ describe('isRetryableError', () => {
       expect(isRetryableError(new Error('Invalid API key'))).toBe(false);
       // 403 isn't asserted here — it's covered in the dedicated '403…is retryable'
       // block above, where it's classified as retryable. (issue #256)
+    });
+  });
+
+  describe('ProviderTimeoutError (our own fetch deadline)', () => {
+    // The class documents that the retry loop is meant to treat a timeout as a
+    // retryable provider error, but its message reads "…request timed out
+    // after Nms" and none of the substring rules cover that wording, so a
+    // merely-slow provider used to kill the whole request instead of failing
+    // over. The surviving single classifier must recognize the real class.
+    // (This block originally asserted the same thing against BOTH the
+    // proxy-local and the lib copy; the local copy is gone, so the one
+    // remaining assertion covers every route.)
+    it('is retryable in the shared lib classifier', () => {
+      expect(isRetryableError(new ProviderTimeoutError(60000))).toBe(true);
+    });
+
+    it('still honors an explicit non-retryable opt-out on a plain error', () => {
+      const err = Object.assign(new Error('Provider request timed out after 60000ms'), { retryable: false });
+      expect(isRetryableError(err)).toBe(false);
     });
   });
 });
