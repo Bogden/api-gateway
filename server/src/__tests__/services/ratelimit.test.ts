@@ -153,6 +153,58 @@ describe('Rate Limiter', () => {
     });
   });
 
+  // The daily counters move for every attempt that REACHED the provider,
+  // refusals included — correct for accounting, since the provider may have
+  // counted them too. But that means failures which say nothing about our
+  // remaining budget (a malformed request, a dead model, a bad credential) can
+  // walk the counter up to the configured rpd, three at a time with retries,
+  // and then promote a healthy key onto the ladder that ends at 24h. So the
+  // ladder is gated a second time, on the failure MEANING exhaustion.
+  // (card c4406)
+  describe('getCooldownDurationForLimit (ladder needs quota evidence, not just a full counter)', () => {
+    it('stays transient at the daily limit when the failure is not about budget', () => {
+      const id = Math.floor(Math.random() * 1_000_000);
+      const platform = 'openrouter';
+      const model = `noevidence-${id}`;
+      // Counter is genuinely at the configured daily limit...
+      for (let i = 0; i < 6; i++) recordRequest(platform, model, id);
+      // ...but a 400/404/401-shaped failure is evidence about OUR call, not
+      // about the key's budget, so it must not quarantine the key. Repeated to
+      // show it never climbs the ladder either.
+      const args = [platform, model, id, { rpd: 5, tpd: null }, null, false] as const;
+      expect(getCooldownDurationForLimit(...args)).toBe(90 * 1000);
+      expect(getCooldownDurationForLimit(...args)).toBe(90 * 1000);
+      expect(getCooldownDurationForLimit(...args)).toBe(90 * 1000);
+    });
+
+    it('escalates on the very same counter when the failure IS a quota refusal', () => {
+      const id = Math.floor(Math.random() * 1_000_000);
+      const platform = 'openrouter';
+      const model = `evidence-${id}`;
+      for (let i = 0; i < 6; i++) recordRequest(platform, model, id);
+      // Identical state to the test above — only the nature of the failure
+      // differs, and that is what may bench the key for the day.
+      const args = [platform, model, id, { rpd: 5, tpd: null }, null, true] as const;
+      expect(getCooldownDurationForLimit(...args)).toBe(2 * 60 * 1000);
+      expect(getCooldownDurationForLimit(...args)).toBe(10 * 60 * 1000);
+    });
+
+    it('a non-budget failure does not even advance the ladder for a later real 429', () => {
+      const id = Math.floor(Math.random() * 1_000_000);
+      const platform = 'openrouter';
+      const model = `mixed-${id}`;
+      for (let i = 0; i < 6; i++) recordRequest(platform, model, id);
+      // Three malformed-request benches first...
+      for (let i = 0; i < 3; i++) {
+        expect(getCooldownDurationForLimit(platform, model, id, { rpd: 5, tpd: null }, null, false)).toBe(90 * 1000);
+      }
+      // ...then a genuine quota refusal starts at the BOTTOM rung, not part-way
+      // up it. Otherwise our own bad requests would silently pre-load the
+      // quarantine.
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: 5, tpd: null }, null, true)).toBe(2 * 60 * 1000);
+    });
+  });
+
   describe('persistent state', () => {
     it('preserves per-key usage and cooldowns after the limiter module reloads', async () => {
       process.env.ENCRYPTION_KEY = '0'.repeat(64);

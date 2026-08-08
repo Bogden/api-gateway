@@ -19,7 +19,7 @@ import { getDb } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
-import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, attemptConsumedQuota, providerAtFault } from '../lib/error-classify.js';
+import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, attemptReachedProvider, indicatesQuotaExhaustion, providerAtFault } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, isAuthorizedV1Request, getStickyModel, setStickyModel } from './proxy.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
@@ -334,7 +334,10 @@ const MODEL_FORBIDDEN_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 function cooldownFor(route: RouteResult, err: any): number {
   if (isPaymentRequiredError(err)) return PAYMENT_REQUIRED_COOLDOWN_MS;
   if (isModelAccessForbiddenError(err)) return MODEL_FORBIDDEN_COOLDOWN_MS;
-  return getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, err?.retryAfterMs);
+  // Only a failure that actually means "out of budget" may escalate onto the
+  // daily ladder; a malformed request or a dead turn takes the transient rest
+  // however high the counters have climbed. (card c4406)
+  return getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, err?.retryAfterMs, indicatesQuotaExhaustion(err));
 }
 
 anthropicRouter.post('/messages', async (req: Request, res: Response) => {
@@ -470,11 +473,12 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, safeError, null, pinnedModelId);
 
       // Failed attempts count against the provider's quota too — see
-      // recordFailedRequest. Skipped when nothing reached the provider, and
-      // also when the provider REFUSED the request rather than serving it
-      // (429/402/403/401): billing a refusal moves the daily counter that
-      // decides a 24h quarantine. Backing off is the cooldown's job below.
-      if (attemptConsumedQuota(err)) {
+      // recordFailedRequest. Refusals included: the provider saw the request
+      // and may well have counted it, and undercounting silently overruns a
+      // real budget. Only a failure that never left the box is skipped.
+      // Whether the failure also escalates the BENCH is a separate question,
+      // answered by indicatesQuotaExhaustion below.
+      if (attemptReachedProvider(err)) {
         recordFailedRequest(route.platform, route.modelId, route.keyId);
       }
 
