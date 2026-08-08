@@ -173,7 +173,11 @@ npm run build
 node server/dist/index.js     # server + dashboard both served on :3001
 ```
 
-`ENCRYPTION_KEY` is required for startup. The server only falls back to a database-stored development key when `DEV_MODE=true` and `NODE_ENV` is not `production`; do not use that fallback with real provider keys.
+`ENCRYPTION_KEY` is required for startup, in every environment. Without it the server prints a fatal banner naming the fix and exits non-zero — it never falls back on its own.
+
+There is one escape hatch, for local development only: setting `API_GATEWAY_ALLOW_INSECURE_DB_KEY=1` lets the server generate a key and store it in the same SQLite file as the encrypted data, so a fresh clone boots without setup. That is not meaningfully encryption — anyone who can read the database file can read every stored provider key — so the server shouts a multi-line warning on every boot in that mode, and refuses it outright if `NODE_ENV=production`. `npm run dev` sets it for you; nothing else does. Never set it on a host holding real provider keys.
+
+(Earlier versions gated this fallback on `NODE_ENV !== 'production'`, which meant any deployment that simply never set `NODE_ENV` — a systemd unit, a bare `node server/dist/index.js` — got the insecure mode silently.)
 
 Request analytics are retained for 90 days or 100000 request rows by default, whichever limit prunes first. Set `REQUEST_ANALYTICS_RETENTION_DAYS=0` or `REQUEST_ANALYTICS_MAX_ROWS=0` in `.env` to disable either retention limit.
 
