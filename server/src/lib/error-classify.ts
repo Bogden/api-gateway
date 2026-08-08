@@ -3,7 +3,33 @@
 // no I/O — so they live in a neutral lib module that any of those can import
 // without forming an import cycle (fusion ↔ proxy in particular).
 
+/** Should the routing loop FAIL OVER — retry this key, rotate to a sibling key,
+ *  or move to the next model in the chain — rather than giving up and handing
+ *  the client an error? Purely forward-looking: it asks whether a DIFFERENT
+ *  route is plausibly better than bailing out, not what this attempt cost.
+ *
+ *  NOT the same question as `attemptReachedProvider` below, and neither can be
+ *  derived from the other — all four combinations occur:
+ *    reached + retryable      → an upstream 429: charge the quota, fail over.
+ *    reached + not retryable  → a 400 the adapter marked `retryable:false`:
+ *                               the provider answered and charged us, but no
+ *                               other route will answer differently.
+ *    not reached + retryable  → `fetch failed`/ECONNREFUSED: nothing was spent
+ *                               upstream, and the next provider is a different
+ *                               host/DNS/TLS path, so failover is free.
+ *    not reached + not retryable → a client abort, or our own validation.
+ *  Conflating them would either 502 the client on every local transport blip
+ *  or charge a provider's quota for requests that never left the box. */
 export function isRetryableError(err: any): boolean {
+  // Explicit provider opt-out: a deterministic upstream failure (e.g. a 400/422
+  // validation rejection) that will fail identically on every attempt. Honored
+  // before every heuristic below so such errors fail fast and are passed
+  // through rather than consuming the recovery budget — and, since failed
+  // attempts that reached the provider now move the limiter's ledger, so a
+  // hopeless retry doesn't spend the account's quota three times over. Set by
+  // the adapter (providers/base.ts ProviderHttpError); only ever `false`, never
+  // `true` to force a retry. (card c1881)
+  if (err?.retryable === false) return false;
   const msg = (err.message ?? '').toLowerCase();
   // Trust the upstream HTTP status the provider attached to the error first
   // (providerHttpError in providers/base.ts sets err.status on every adapter).

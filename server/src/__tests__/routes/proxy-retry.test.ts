@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { isRetryableError, isPaymentRequiredError } from '../../routes/proxy.js';
+// Both classifiers now live in lib/error-classify.ts only — routes/proxy.ts
+// used to carry a second, drifted copy. See error-classify-retryable.test.ts.
+import { isRetryableError, isPaymentRequiredError } from '../../lib/error-classify.js';
 
 describe('isRetryableError', () => {
   describe('413 Payload Too Large', () => {
