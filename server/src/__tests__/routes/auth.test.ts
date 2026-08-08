@@ -19,6 +19,7 @@ async function call(
   path: string,
   body?: unknown,
   token?: string,
+  extraHeaders?: Record<string, string>,
 ) {
   const server = app.listen(0);
   const addr = server.address() as { port: number };
@@ -30,6 +31,7 @@ async function call(
       // Spoof a remote source IP — the server's `requireAuth` honors this
       // because the test app is configured with `trust proxy = 1`.
       'X-Forwarded-For': REMOTE_IP,
+      ...(extraHeaders ?? {}),
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -69,7 +71,19 @@ describe('Dashboard auth (#35)', () => {
     expect((await call(app, 'GET', '/api/ping')).status).toBe(200);
     // /v1 has its own (unified-key) auth, so it 401s for a different reason —
     // the point is it is not gated by the dashboard session middleware.
-    const proxy = await call(app, 'POST', '/v1/chat/completions', { messages: [{ role: 'user', content: 'x' }] });
+    // Browser-shape this request (send an Origin header) so the keyless
+    // loopback-CLI bypass (proxy.ts isLocalCliRequest, policy 6f4d3c9/2736fc1)
+    // does NOT grant it — a browser-origin request must present the unified
+    // key, so it correctly falls through to 401 authentication_error instead
+    // of being authorized and hitting the model-exhaustion rate_limit path.
+    const proxy = await call(
+      app,
+      'POST',
+      '/v1/chat/completions',
+      { messages: [{ role: 'user', content: 'x' }] },
+      undefined,
+      { Origin: 'http://example.com' },
+    );
     expect(proxy.body.error.type).toBe('authentication_error');
   });
 
