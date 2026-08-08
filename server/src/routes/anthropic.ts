@@ -19,7 +19,7 @@ import { getDb } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
-import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, attemptReachedProvider } from '../lib/error-classify.js';
+import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, attemptReachedProvider, providerAtFault } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, isAuthorizedV1Request, getStickyModel, setStickyModel } from './proxy.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
@@ -482,7 +482,14 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       if (isRetryableError(err)) {
         if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        setCooldown(route.platform, route.modelId, route.keyId, cooldownFor(route, err));
+        // Fail over on any retryable error, but only REST the key when the
+        // provider is the one at fault — isRetryableError says yes to
+        // `fetch failed`, so gating the bench on it benched every key in the
+        // chain during a purely local network outage. skipKeys above still
+        // rotates away from this route for the rest of this request.
+        if (providerAtFault(err)) {
+          setCooldown(route.platform, route.modelId, route.keyId, cooldownFor(route, err));
+        }
         recordRateLimitHit(route.modelDbId);
         // (upstream also called learnLimitFromError here — the fork has no
         // learn-limits service; cooldowns come from computeRetryCooldownMs.)

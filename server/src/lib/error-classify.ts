@@ -19,7 +19,10 @@
  *                               host/DNS/TLS path, so failover is free.
  *    not reached + not retryable → a client abort, or our own validation.
  *  Conflating them would either 502 the client on every local transport blip
- *  or charge a provider's quota for requests that never left the box. */
+ *  or charge a provider's quota for requests that never left the box.
+ *
+ *  Do NOT gate a cooldown on this predicate — "worth trying elsewhere" is not
+ *  "this key deserves a rest". Use `providerAtFault` for that. */
 export function isRetryableError(err: any): boolean {
   // Explicit provider opt-out: a deterministic upstream failure (e.g. a 400/422
   // validation rejection) that will fail identically on every attempt. Honored
@@ -120,6 +123,88 @@ export function attemptReachedProvider(err: any): boolean {
     || msg.includes('stream ended unexpectedly')
     || msg.includes('stream stalled')
     || msg.includes('unparseable inline tool-call dialect');
+}
+
+/** Is this failure attributable to the PROVIDER — its rate limit, its quota
+ *  accounting for our account, its outage, its tier policy, its bad response —
+ *  such that RESTING this key (a cooldown that outlives the request) is the
+ *  right response? The third question in this file, and the only one that may
+ *  gate `setCooldown`.
+ *
+ *  Distinct from `isRetryableError`, which the cooldown sites used to stand in
+ *  for. Retryable asks "is another route better than erroring the client?" and
+ *  is deliberately generous — it says yes to a local transport death, because
+ *  the next provider is a different host/DNS/TLS path. Benching a key on that
+ *  same yes is a category error: during a total local network outage EVERY
+ *  attempt dies as `fetch failed`, so the routing loop would walk the chain and
+ *  leave every key it touched benched (and the bench is persisted, so it
+ *  outlives the outage). Keys that did nothing wrong must not be rested for a
+ *  fault on our side of the wire.
+ *
+ *  RELATION TO `attemptReachedProvider`: a strict SUBSET, not an equivalence,
+ *  which is why both must exist. Nothing that never reached the provider can be
+ *  the provider's fault, so this returns false wherever that one does — the
+ *  implication is enforced structurally by the first check below rather than by
+ *  a parallel list that could drift. But the converse fails, and the gap is
+ *  exactly the set that must NOT rest a key:
+ *    reached + at fault      → 429/402/403/404/5xx, or a 200 whose turn was
+ *                              dead: an upstream condition of this key/model.
+ *    reached + NOT at fault  → a 400 (our request shape), a 401 (our
+ *                              credential), an adapter's `retryable:false`
+ *                              deterministic rejection, our own dispatch
+ *                              deadline. The provider answered and charged us,
+ *                              so the limiter must count it — but the key is
+ *                              healthy and resting it helps nothing.
+ *    not reached + at fault  → empty, and necessarily so: a failure that never
+ *                              left the box carries no evidence about the
+ *                              provider. Provider-side DNS death is
+ *                              indistinguishable from our resolver dying, so it
+ *                              is not attributed.
+ *  Collapsing the two would either charge quota for requests that never left
+ *  the box or bench a healthy key for our own malformed request. */
+export function providerAtFault(err: any): boolean {
+  if (!err) return false;
+  // Enforces the subset relationship above: no reach, no attribution. This is
+  // what spares every key during a total local outage — `fetch failed`,
+  // ECONNREFUSED, DNS and TLS deaths all fail here.
+  if (!attemptReachedProvider(err)) return false;
+  // OUR deadline, not their silence. `attemptReachedProvider` counts a timeout
+  // because over-counting quota is the safe direction there; for resting a key
+  // the safe direction is the opposite. The timer in fetchWithTimeout
+  // (providers/base.ts:188) starts BEFORE the connection is established, so a
+  // timeout does not even prove the provider saw the request — during a network
+  // fault that hangs rather than refuses, every key would time out and every key
+  // would be benched. A genuinely hung provider is still skipped for the rest of
+  // the request by skipKeys/markExhausted; only the cross-request bench is given
+  // up, and a too-tight deadline against a cold-starting provider (NVIDIA's
+  // 15-60s serverless starts) no longer benches a healthy key.
+  if (err.name === 'ProviderTimeoutError') return false;
+  // The adapter knows this failure is deterministic — it set `retryable: false`
+  // for a request-shaped rejection (providers/chatgpt.ts 400/422). A request we
+  // built wrong is not the key's fault, and every future request on this key is
+  // unaffected.
+  if (err.retryable === false) return false;
+  // Request- and credential-shaped rejections. 400/422: the provider read our
+  // request and rejected its CONTENT — a sibling request would succeed on this
+  // same key. 401: our credential is bad, which is a real problem but not one a
+  // 90s rest fixes; validateKey/the health checker disable a genuinely dead key
+  // outright, a stronger and more durable response than a cooldown.
+  // 403 is deliberately NOT here: it is the provider's tier policy for this
+  // key+model, a durable upstream fact, and the caller benches it for a day.
+  const status = effectiveStatus(err);
+  if (status === 400 || status === 401 || status === 422) return false;
+  return true;
+}
+
+/** The upstream HTTP status, preferring the structured `err.status` every
+ *  adapter sets via providerHttpError and falling back to the "<Name> API error
+ *  <status>: …" message format for errors that carry a code only in their text
+ *  (the same fallback `attemptReachedProvider` matches on). 0 when neither
+ *  carries one — e.g. a dead-turn error off a 200 response. */
+function effectiveStatus(err: any): number {
+  if (typeof err?.status === 'number') return err.status;
+  const m = /api error (\d{3})/.exec((err?.message ?? '').toLowerCase());
+  return m ? Number(m[1]) : 0;
 }
 
 // A 402 Payment Required / out-of-credits error. Distinct from a transient 429:

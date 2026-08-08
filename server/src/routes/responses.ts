@@ -11,7 +11,7 @@ import type {
 } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, hasEnabledVisionModel, type RouteResult } from '../services/router.js';
 import { recordRequest, recordFailedRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
-import { attemptReachedProvider, isRetryableError, isPaymentRequiredError } from '../lib/error-classify.js';
+import { attemptReachedProvider, providerAtFault, isRetryableError, isPaymentRequiredError } from '../lib/error-classify.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -844,11 +844,19 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
       if (isRetryableError(err)) {
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(
-          isPaymentRequiredError(err),
-          route.platform, route.modelId, route.keyId,
-          { rpd: route.rpdLimit, tpd: route.tpdLimit },
-        ));
+        // Fail over on any retryable error, but only REST the key when the
+        // provider is the one at fault. This used to key off isRetryableError,
+        // which says yes to `fetch failed` — so a total local network outage
+        // benched every key the chain touched, each for a persisted 90s, for a
+        // fault entirely on our side of the wire. skipKeys above still rotates
+        // away from this route for the rest of this request either way.
+        if (providerAtFault(err)) {
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(
+            isPaymentRequiredError(err),
+            route.platform, route.modelId, route.keyId,
+            { rpd: route.rpdLimit, tpd: route.tpdLimit },
+          ));
+        }
         recordRateLimitHit(route.modelDbId);
         lastError = err;
         continue;

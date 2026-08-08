@@ -6,7 +6,7 @@ import type { ChatMessage, ModelListRow } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
 import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
 import { recordRequest, recordFailedRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
-import { attemptReachedProvider, isRetryableError, isPaymentRequiredError } from '../lib/error-classify.js';
+import { attemptReachedProvider, providerAtFault, isRetryableError, isPaymentRequiredError } from '../lib/error-classify.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
@@ -1580,17 +1580,28 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     markExhausted(route.keyId, route.platform, route.modelId);
     const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
     skipKeys.add(skipId);
-    setCooldown(
-      route.platform,
-      route.modelId,
-      route.keyId,
-      computeRetryCooldownMs(
-        isPaymentRequiredError(lastError),
-        route.platform, route.modelId, route.keyId,
-        { rpd: route.rpdLimit, tpd: route.tpdLimit },
-        lastError?.retryAfterMs,
-      ),
-    );
+    // Exhausting the per-key retries says this key isn't working RIGHT NOW; it
+    // does not say the key deserves a persisted rest. This bench was ungated,
+    // so a total local network outage — every attempt dying as `fetch failed`
+    // before it left the box — walked the chain and left every key it touched
+    // benched, unroutable (router.ts:700) even after the network came back.
+    // markExhausted + skipKeys above still rotate to the next key regardless;
+    // only the cross-request bench is now conditional on the provider being at
+    // fault. Reached here only for retryable errors — a non-retryable one
+    // returns to the client above without exhausting the key.
+    if (providerAtFault(lastError)) {
+      setCooldown(
+        route.platform,
+        route.modelId,
+        route.keyId,
+        computeRetryCooldownMs(
+          isPaymentRequiredError(lastError),
+          route.platform, route.modelId, route.keyId,
+          { rpd: route.rpdLimit, tpd: route.tpdLimit },
+          lastError?.retryAfterMs,
+        ),
+      );
+    }
     recordRateLimitHit(route.modelDbId);
     lastRequestTime = Date.now();
     publish({ type: 'routing.key_exhausted', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, reason: sanitizeProviderErrorMessage(lastError?.message), at: Date.now() });
