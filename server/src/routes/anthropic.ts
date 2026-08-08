@@ -12,14 +12,14 @@ import type {
 } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
 import {
-  recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit,
+  recordRequest, recordFailedRequest, recordTokens, setCooldown, getCooldownDurationForLimit,
   PAYMENT_REQUIRED_COOLDOWN_MS,
 } from '../services/ratelimit.js';
 import { getDb } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
-import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError } from '../lib/error-classify.js';
+import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, attemptReachedProvider } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, isAuthorizedV1Request, getStickyModel, setStickyModel } from './proxy.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
@@ -414,6 +414,8 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       // Empty completion → fail over, exactly like the OpenAI route.
       if (!respText && respToolCalls.length === 0) {
         logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)', null, pinnedModelId);
+        // A 200 with nothing in it still spent the provider's request quota.
+        recordFailedRequest(route.platform, route.modelId, route.keyId);
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
         setCooldown(route.platform, route.modelId, route.keyId, cooldownFor(route, {}));
         recordRateLimitHit(route.modelDbId);
@@ -467,6 +469,12 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       const safeError = sanitizeProviderErrorMessage(err.message);
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, safeError, null, pinnedModelId);
 
+      // Failed attempts count against the provider's quota too — see
+      // recordFailedRequest. Skipped when nothing reached the provider.
+      if (attemptReachedProvider(err)) {
+        recordFailedRequest(route.platform, route.modelId, route.keyId);
+      }
+
       // A stream that already sent its `message_start` cannot fail over — the
       // helper finished the SSE response itself. Bubble back without retrying.
       if (err instanceof StreamAlreadyStarted) return;
@@ -484,6 +492,13 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
 
       sendError(res, 502, 'api_error', `Provider error (${route.displayName}): ${safeError}`);
       return;
+    } finally {
+      // `routeRequest` reserved this provider's in-flight slot; this route
+      // never gave it back, so every /v1/messages request permanently consumed
+      // one and a provider with maxParallelRequests set eventually looked full
+      // forever. One reservation per attempt, one release per attempt — the
+      // handle is one-shot, so it cannot double-decrement either.
+      route.release();
     }
   }
 

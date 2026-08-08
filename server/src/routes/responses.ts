@@ -10,7 +10,8 @@ import type {
   ChatContentBlock,
 } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, hasEnabledVisionModel, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
+import { recordRequest, recordFailedRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
+import { attemptReachedProvider } from '../lib/error-classify.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -829,6 +830,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         return;
       }
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
+
+      // Failed attempts count against the provider's quota too — see
+      // recordFailedRequest. Skipped when nothing reached the provider.
+      if (attemptReachedProvider(err)) {
+        recordFailedRequest(route.platform, route.modelId, route.keyId);
+      }
 
       // Mid-stream failures can't be retried (bytes already sent) — close cleanly.
       if (stream && streamStarted) {

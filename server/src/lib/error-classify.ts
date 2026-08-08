@@ -68,6 +68,34 @@ export function isRetryableError(err: any): boolean {
     || msg.includes('unparseable inline tool-call dialect');
 }
 
+/** True when a failed attempt provably REACHED the provider, i.e. the provider
+ *  accepted the request and answered: any HTTP status came back (adapters set
+ *  `err.status` via providerHttpError, and format their message as
+ *  "<Name> API error <status>: …"), or it answered 200 and the turn died on our
+ *  side of the parse (empty completion, in-band error frame, truncated/stalled
+ *  stream, unparseable inline tool-call dialect). A provider counts those
+ *  against the account's request quota exactly like a success, so the rate
+ *  limiter must count them too.
+ *
+ *  Deliberately FALSE for failures where nothing was accepted upstream — a
+ *  client abort (`RequestAbortError`, no status), and transport deaths before
+ *  the request is on the wire (`fetch failed`, ECONNREFUSED, DNS, TLS). Those
+ *  consumed no provider quota, and charging them would bench a healthy key for
+ *  a local network fault. `ProviderTimeoutError` DOES count: our deadline fires
+ *  only after the request was dispatched, so the provider has it. */
+export function attemptReachedProvider(err: any): boolean {
+  if (!err) return false;
+  if (typeof err.status === 'number' && err.status >= 400) return true;
+  if (err.name === 'ProviderTimeoutError') return true;
+  const msg = (err.message ?? '').toLowerCase();
+  if (/api error \d{3}/.test(msg)) return true;
+  return msg.includes('empty completion')
+    || msg.includes('in-band provider error')
+    || msg.includes('stream ended unexpectedly')
+    || msg.includes('stream stalled')
+    || msg.includes('unparseable inline tool-call dialect');
+}
+
 // A 402 Payment Required / out-of-credits error. Distinct from a transient 429:
 // it won't recover on the next window, so the caller benches the model+key with
 // PAYMENT_REQUIRED_COOLDOWN_MS (a full day) rather than the 90s transient cooldown.

@@ -5,7 +5,8 @@ import { z } from 'zod';
 import type { ChatMessage, ModelListRow } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
 import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
-import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
+import { recordRequest, recordFailedRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
+import { attemptReachedProvider } from '../lib/error-classify.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
@@ -1105,7 +1106,18 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       || routeModelIdLower.includes('minimaxai/minimax-m');
 
     // ---- Per-key retry: up to PER_KEY_RETRIES immediate attempts ----
+    // One reservation, one release: `routeRequest` reserved this provider's
+    // in-flight slot once, and this try/finally owns it for the WHOLE per-key
+    // retry cycle. The release used to sit in a `finally` INSIDE the loop, so a
+    // retrying request released a slot per attempt against a single
+    // reservation — driving the provider's in-flight counter below its true
+    // value, stealing capacity from concurrent requests and letting real
+    // concurrency exceed maxParallelRequests. Every exit (success, non-
+    // retryable error, `continue outerLoop`, key exhaustion, or a thrown
+    // exception) unwinds through this finally exactly once; `release` is itself
+    // one-shot, so a double call can never decrement twice.
     let keySucceeded = false;
+    try {
     keyRetry: for (let keyAttempt = 0; keyAttempt < PER_KEY_RETRIES; keyAttempt++) {
       try {
       if (stream) {
@@ -1393,6 +1405,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
             logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), null, pinnedModelId);
+            // The provider answered and streamed real payload before dying —
+            // fully charged against its request quota, so the limiter counts it.
+            recordFailedRequest(route.platform, route.modelId, route.keyId);
             recordRateLimitHit(route.modelDbId);
             return;
           }
@@ -1519,6 +1534,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       const safeError = sanitizeProviderErrorMessage(err.message);
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
 
+      // Charge the attempt to the limiter even though it failed. The ledger
+      // used to move only on success, so a provider that started rejecting us
+      // froze the rpm/rpd counters and the provider-wide daily cap — the
+      // limiter went blind (and kept routing) exactly when it needed to back
+      // off. Gated so a failure that never reached the provider (transport
+      // death; client aborts already returned above) isn't charged to it.
+      if (attemptReachedProvider(err)) {
+        recordFailedRequest(route.platform, route.modelId, route.keyId);
+      }
 
       if (isRetryableError(err)) {
         // A pinned ChatGPT subscription has no legitimate fallback provider.
@@ -1593,10 +1617,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         });
         return;
       }
+    }
+    } // end keyRetry
     } finally {
       route.release();
     }
-    } // end keyRetry
 
     // Key exhausted: all PER_KEY_RETRIES attempts failed.
     // Mark it so the router cycles to the next key (and in 1 RPM mode,
