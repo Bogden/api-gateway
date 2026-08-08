@@ -245,13 +245,73 @@ describe('a key is rested only when the provider is at fault', () => {
     expect(cooledKeys()).toEqual([]);
   });
 
-  // NOTE on the dispatch-deadline row of the attribution table: it is pinned at
-  // the predicate level (error-classify-attribution.test.ts) rather than here on
-  // purpose. A ProviderTimeoutError never reaches a cooldown site today anyway,
-  // because isRetryableError does not match it — its message reads "timed out"
-  // while the substring rules look for "timeout"/"etimedout", and it carries no
-  // err.status — so the route returns it to the client instead of failing over.
-  // That is a gap in the RETRYABILITY predicate, not this one; a route-level
-  // test here would pass for that unrelated reason and mislead the next reader.
-  // providerAtFault still classifies it correctly for when that gap is closed.
+  // ── The dispatch-deadline row: retryable BUT not the provider's fault ──
+  //
+  // This block only became reachable when the two branches were integrated, and
+  // it is the one combination neither could test alone. The retryability fix
+  // makes ProviderTimeoutError match isRetryableError (lib/error-classify.ts),
+  // so a timeout now walks the retry loop instead of being returned to the
+  // client; providerAtFault deliberately answers NO for the same error, because
+  // our deadline can fire before the connection is even established. Combined:
+  // a provider timeout FAILS OVER and does NOT bench the key. An earlier
+  // revision of this file carried a note saying a timeout never reaches a
+  // cooldown site "because isRetryableError does not match it" — that premise
+  // is now false, so these tests replace it.
+  function timeoutError() {
+    // Exactly what fetchWithTimeout throws (providers/base.ts): no status, and
+    // a message none of the retryability substring rules cover.
+    const e = new Error('Provider request timed out after 60000ms');
+    e.name = 'ProviderTimeoutError';
+    return e;
+  }
+
+  it('fails over to a later attempt on a provider timeout instead of erroring the client', async () => {
+    chatCompletion
+      .mockRejectedValueOnce(timeoutError())
+      .mockResolvedValue({
+        choices: [{ message: { role: 'assistant', content: 'ok' } }],
+        usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+      });
+
+    const { status, body } = await post(app, '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'hi' }],
+    }, key);
+
+    // The failover half (the retryability fix): the slow attempt did not kill
+    // the request. Before that fix this returned an error after one attempt.
+    expect(status).toBe(200);
+    expect(body.choices[0].message.content).toBe('ok');
+    expect(chatCompletion.mock.calls.length).toBeGreaterThan(1);
+    // The attribution half (the cooldown predicate): nothing was benched.
+    expect(cooledKeys()).toEqual([]);
+    expect(persistedCooldownRows()).toBe(0);
+  });
+
+  it('walks the whole chain on a total timeout without resting any key', async () => {
+    chatCompletion.mockImplementation(async () => { throw timeoutError(); });
+
+    const { status } = await post(app, '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'hi' }],
+    }, key);
+
+    // Retryable, so the loop rotated keys rather than bailing on attempt one.
+    expect(chatCompletion.mock.calls.length).toBeGreaterThan(1);
+    expect(status).toBeGreaterThanOrEqual(400);
+    // But our own deadline is not evidence against any key: none rested, and
+    // nothing persisted that would outlive the slow window.
+    expect(cooledKeys()).toEqual([]);
+    expect(persistedCooldownRows()).toBe(0);
+  });
+
+  it('rests the key on the same route when the provider itself answers 429', async () => {
+    // Control for the pair above: the failover machinery is identical, so this
+    // pins that dropping the timeout bench did not disarm the bench generally.
+    chatCompletion.mockImplementation(async () => { throw RATE_LIMITED; });
+
+    await post(app, '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'hi' }],
+    }, key);
+
+    expect(cooledKeys().length).toBeGreaterThan(0);
+  });
 });
