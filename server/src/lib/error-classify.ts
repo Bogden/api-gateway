@@ -33,6 +33,25 @@ export function isRetryableError(err: any): boolean {
   // the adapter (providers/base.ts ProviderHttpError); only ever `false`, never
   // `true` to force a retry. (card c1881)
   if (err?.retryable === false) return false;
+  // Our own fetch deadline (providers/base.ts ProviderTimeoutError). Matched on
+  // the error's NAME, not its message: the message reads "Provider request timed
+  // out after Nms", which none of the substring rules below cover ("timeout" and
+  // "etimedout" both miss "timed out"), and it carries no err.status — so a
+  // merely-slow provider (the common free-tier failure, and NVIDIA/Cloudflare
+  // cold starts in particular) used to end the whole request instead of failing
+  // over, contradicting the class's own doc comment. Name rather than
+  // `instanceof` so this module keeps importing nothing from providers/ — see
+  // the file header — and to match `attemptReachedProvider`/`providerAtFault`
+  // below, which test the same error the same way.
+  //
+  // Deliberately placed AFTER the opt-out above: an adapter that explicitly
+  // marks a failure non-retryable still wins.
+  //
+  // NOTE the deliberate split from `providerAtFault`: a timeout IS retryable
+  // (fail over to another provider) but is NOT the provider's fault (do not
+  // rest the key) — our deadline can fire before the connection is even
+  // established. The two predicates disagree here on purpose.
+  if (err?.name === 'ProviderTimeoutError') return true;
   const msg = (err.message ?? '').toLowerCase();
   // Trust the upstream HTTP status the provider attached to the error first
   // (providerHttpError in providers/base.ts sets err.status on every adapter).
