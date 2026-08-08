@@ -19,6 +19,7 @@ async function call(
   path: string,
   body?: unknown,
   token?: string,
+  extraHeaders: Record<string, string> = {},
 ) {
   const server = app.listen(0);
   const addr = server.address() as { port: number };
@@ -30,6 +31,7 @@ async function call(
       // Spoof a remote source IP — the server's `requireAuth` honors this
       // because the test app is configured with `trust proxy = 1`.
       'X-Forwarded-For': REMOTE_IP,
+      ...extraHeaders,
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -69,7 +71,10 @@ describe('Dashboard auth (#35)', () => {
     expect((await call(app, 'GET', '/api/ping')).status).toBe(200);
     // /v1 has its own (unified-key) auth, so it 401s for a different reason —
     // the point is it is not gated by the dashboard session middleware.
-    const proxy = await call(app, 'POST', '/v1/chat/completions', { messages: [{ role: 'user', content: 'x' }] });
+    // An Origin header makes the request browser-shaped, so the keyless
+    // loopback-CLI bypass (isLocalCliRequest) declines it and unified-key
+    // auth fires — matching the proxy-auth-cors.test.ts convention.
+    const proxy = await call(app, 'POST', '/v1/chat/completions', { messages: [{ role: 'user', content: 'x' }] }, undefined, { Origin: 'https://attacker.example' });
     expect(proxy.body.error.type).toBe('authentication_error');
   });
 
