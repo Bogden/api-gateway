@@ -48,7 +48,9 @@ export class CohereProvider extends BaseProvider {
       const err = await res.json().catch(() => ({}));
       throw providerHttpError(res, `Cohere API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
     }
-    const data = await res.json() as ChatCompletionResponse;
+    const data = JSON.parse(
+      await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal),
+    ) as ChatCompletionResponse;
     data._routed_via = { platform: this.platform, model: modelId };
     return data;
   }

@@ -4,7 +4,7 @@ import type {
   ChatCompletionChunk,
   Platform,
 } from '@api-gateway/shared/types.js';
-import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, ProviderTimeoutError, RequestAbortError, type CompletionOptions } from './base.js';
 import { extractErrorMessage } from '../lib/error-body.js';
 import {
   openAiCompatThinkingPolicy,
@@ -132,8 +132,15 @@ export class OpenAICompatProvider extends BaseProvider {
 
     let data: ChatCompletionResponse;
     try {
-      data = await res.json() as ChatCompletionResponse;
-    } catch {
+      data = JSON.parse(
+        await this.readBodyText(res, this.bodyReadTimeoutMs, options?.abortSignal),
+      ) as ChatCompletionResponse;
+    } catch (err) {
+      // A stalled body read (backend sent 200 then went silent) or a client
+      // disconnect is NOT a "non-JSON body" — surface it as the timeout/abort
+      // it is so the proxy retries / ends silently instead of reporting a bogus
+      // "endpoint is not OpenAI-compatible". (card c576)
+      if (err instanceof ProviderTimeoutError || err instanceof RequestAbortError) throw err;
       // A 200 whose body isn't a single JSON document — typically a base URL
       // pointing at a non-OpenAI-compatible API (e.g. Ollama's native NDJSON
       // /api endpoints instead of /v1, #189). Surface what's wrong instead of
