@@ -161,40 +161,58 @@ export function attemptReachedProvider(err: any): boolean {
     || msg.includes('unparseable inline tool-call dialect');
 }
 
-/** Did this attempt actually SPEND the account's request quota, such that the
- *  rate limiter's rpm/rpd windows and the provider-wide daily cap must move?
- *  The fourth question in this file, and the only one that may gate
- *  `recordFailedRequest`.
+/** Does this failure mean THIS KEY IS OUT OF QUOTA FOR TODAY? The fourth
+ *  question in this file, and the only one that may promote a cooldown onto the
+ *  escalating daily ladder (2m → 10m → 1h → 24h) in
+ *  `getCooldownDurationForLimit`.
  *
- *  A strict subset of `attemptReachedProvider`: reaching the provider is
- *  necessary but not sufficient. The gap is the set of statuses where the
- *  provider REFUSED the request at the gate rather than serving it —
- *    429  we are over a limit, so it declined to do the work,
- *    402  the account is out of credits,
- *    403  this key's tier may not have this model,
- *    401  the credential was rejected before anything ran.
- *  Most free tiers do not bill a refusal against the daily quota, and charging
- *  them is actively harmful rather than merely imprecise: the retry loop makes
- *  PER_KEY_RETRIES attempts, so ONE refused request moved the daily counter by
- *  three. That counter is what `getCooldownDurationForLimit` reads to decide a
- *  429 is a DAILY exhaustion rather than a transient one, which promotes the
- *  bench from a 90s rest onto the 2m→10m→1h→24h ladder, and it is what
- *  `canUseProvider` reads to skip every model on the provider. A key could be
- *  quarantined for a day on usage the provider never charged. (card c4406)
+ *  Deliberately NOT the same question as "did the provider refuse this?".
+ *  Refusals come in two kinds and they are evidence about different things:
+ *    429  we are over a rate/quota limit  → about the KEY's remaining budget.
+ *    402  the account is out of credits   → about the KEY's remaining budget.
+ *    ------------------------------------------------------------------
+ *    400/422  the provider parsed our request and rejected its CONTENT
+ *    404/410  the model is gone
+ *    401      our credential is bad
+ *    403      this key's tier may not have this model
+ *  The second group is evidence about OUR call or about a durable access fact,
+ *  not about how much budget the key has left. Escalating on those quarantines
+ *  a perfectly healthy key for up to a day because of a bug on our side — the
+ *  same failure as billing a request that never left the box, wearing a
+ *  different hat. The retry loop makes PER_KEY_RETRIES attempts, so one
+ *  malformed request could push the daily counter three at a time toward a
+ *  threshold that ends in a 24h bench. (card c4406)
  *
- *  Excluding refusals does NOT reopen the blindness this accounting was added
- *  to fix — "stop sending to this key" is the cooldown's job, and a 429 still
- *  sets one via `providerAtFault`. This predicate only decides whether the
- *  attempt is billed, not whether we back off.
+ *  Note this predicate does NOT decide whether the attempt is BILLED. Anything
+ *  that reached the provider is billed, refusals included — see
+ *  `attemptReachedProvider` and `recordFailedRequest`. Undercounting silently
+ *  overruns a real budget, and the provider may well have counted the refusal
+ *  on its side. The two questions are separate and answered separately.
  *
- *  Everything the provider DID serve still counts: a 5xx (it tried and broke),
- *  a 400/422 (it parsed our request and rejected the content), a 404/410 (it
- *  resolved the route), our own dispatch deadline (it has the request), and any
- *  dead turn off a 200 (it streamed). Those spend quota exactly like a success. */
-export function attemptConsumedQuota(err: any): boolean {
+ *  KNOWN LIMIT, worth stating rather than papering over: this reliably tells a
+ *  quota-shaped refusal from a request-shaped one, because adapters attach
+ *  `err.status`. It does NOT tell a per-minute rate limit from a genuine daily
+ *  exhaustion — both are 429. That distinction is made separately, and only
+ *  approximately, by comparing our OWN configured rpd/tpd against the recorded
+ *  daily counts in `getCooldownDurationForLimit`; where those limits are unset
+ *  or wrong, a transient burst and a real daily exhaustion are indistinguishable
+ *  from the status alone. */
+export function indicatesQuotaExhaustion(err: any): boolean {
+  if (!err) return false;
+  // Never dispatched → no evidence about the key's budget at all. Covers our
+  // own ChatGPT plan-cooldown 429, which is self-imposed.
   if (!attemptReachedProvider(err)) return false;
   const status = effectiveStatus(err);
-  return !(status === 401 || status === 402 || status === 403 || status === 429);
+  if (status === 429 || status === 402) return true;
+  // A status we could read that is NOT budget-shaped settles it — don't let the
+  // message fallback below re-admit a 400 that merely mentions "quota".
+  if (status !== 0) return false;
+  // No numeric status: fall back to the wording providers use for budget
+  // exhaustion. `isPaymentRequiredError` covers the 402 family in prose.
+  const msg = (err.message ?? '').toLowerCase();
+  return msg.includes('rate limit') || msg.includes('too many requests')
+    || msg.includes('quota') || msg.includes('resource_exhausted')
+    || isPaymentRequiredError(err);
 }
 
 /** Is this failure attributable to the PROVIDER — its rate limit, its quota

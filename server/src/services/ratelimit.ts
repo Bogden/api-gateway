@@ -353,7 +353,12 @@ export const PAYMENT_REQUIRED_COOLDOWN_MS = DAY;
 
 /** Compute the cooldown duration for a retryable error. Encapsulates the
  *  payment-required vs transient decision so both the proxy and responses
- *  routers apply the same policy. */
+ *  routers apply the same policy.
+ *
+ *  `quotaEvidence` — does this failure actually say the key is out of budget?
+ *  Only then may the bench escalate onto the daily ladder. Callers pass
+ *  `indicatesQuotaExhaustion(err)`; see the note in getCooldownDurationForLimit
+ *  below. (card c4406) */
 export function computeRetryCooldownMs(
   isPaymentRequired: boolean,
   platform: string,
@@ -361,9 +366,10 @@ export function computeRetryCooldownMs(
   keyId: number,
   limits: { rpd: number | null; tpd: number | null },
   retryAfterMs?: number | null,
+  quotaEvidence = true,
 ): number {
   if (isPaymentRequired) return PAYMENT_REQUIRED_COOLDOWN_MS;
-  return getCooldownDurationForLimit(platform, modelId, keyId, limits, retryAfterMs);
+  return getCooldownDurationForLimit(platform, modelId, keyId, limits, retryAfterMs, quotaEvidence);
 }
 
 // Decide how long to bench a model+key after an upstream 429. Escalate to the
@@ -379,17 +385,31 @@ export function computeRetryCooldownMs(
 // (2m → 10m → 1h → 24h) and quarantined a perfectly healthy provider for the
 // rest of the day. Daily counters are persisted (countPersistedRequests /
 // sumPersistedTokens), so this verdict is stable across restarts.
+//
+// `quotaEvidence` is the second half of that same guard, and exists because the
+// threshold alone is not enough. The daily counters move for EVERY attempt that
+// reached the provider, refusals included — which is correct for accounting,
+// since the provider may have counted them too. But it means a burst of
+// failures that say nothing about our remaining budget (a malformed request, a
+// model that no longer exists, a bad credential) can walk the counter up to the
+// configured rpd and, on the next bench, promote a healthy key onto the ladder
+// that ends at 24h. PER_KEY_RETRIES makes it three at a time. So the ladder is
+// additionally gated on the failure MEANING exhaustion — a 429 or a 402 — via
+// indicatesQuotaExhaustion. Anything else takes the transient rest, no matter
+// what the counters say. Quarantining a key for a day over our own bug is the
+// same defect as billing a request that never left the box. (card c4406)
 export function getCooldownDurationForLimit(
   platform: string,
   modelId: string,
   keyId: number,
   limits: { rpd: number | null; tpd: number | null },
   retryAfterMs?: number | null,
+  quotaEvidence = true,
 ): number {
   const now = Date.now();
-  const rpdExhausted =
+  const rpdExhausted = quotaEvidence &&
     limits.rpd !== null && requestCount(platform, modelId, keyId, DAY, now) >= limits.rpd;
-  const tpdExhausted =
+  const tpdExhausted = quotaEvidence &&
     limits.tpd !== null && tokenCount(platform, modelId, keyId, DAY, now) >= limits.tpd;
   const base = (rpdExhausted || tpdExhausted)
     ? getNextCooldownDuration(platform, modelId, keyId)

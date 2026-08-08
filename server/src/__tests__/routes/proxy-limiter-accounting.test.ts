@@ -12,15 +12,23 @@ import type { Express } from 'express';
 //     once per RETRY, so a retrying request handed back more slots than it
 //     took and stole capacity from concurrent requests. The /v1/messages route
 //     had the mirror-image bug: it claimed a slot and never released it.
-//  3. the first cut of (1) billed too broadly: it charged any attempt that
-//     REACHED the provider, including ones the provider REFUSED at the gate
-//     (429/402/403/401) rather than served. With PER_KEY_RETRIES attempts per
-//     request, one refused request moved the daily counter three times — and
-//     that counter is what promotes a 90s rest onto the 2m→10m→1h→24h ladder,
-//     so a key could be quarantined for a day on usage that never happened.
-//     It also under-billed: /v1/messages rethrows a mid-stream death as an
-//     empty wrapper class carrying no status, so the one route that had
-//     certainly spent quota recorded nothing. (card c4406)
+//  3. (1) drew its line in the wrong place, in both directions. It billed
+//     failures that never left the box — our own ChatGPT plan-cooldown throws
+//     a self-imposed 429 precisely to AVOID dispatching, and the Responses
+//     translator throws a 400 while building the request — while NOT billing
+//     one that certainly did: /v1/messages rethrows a mid-stream death as an
+//     empty wrapper class carrying no status, so the route that had actually
+//     spent quota recorded nothing. The deciding line is whether the request
+//     left the box, not whether it was accepted.
+//     Separately, the daily counter is not the same question as the daily
+//     LADDER. Every attempt that reached the provider is billed, refusals
+//     included. But only a failure that means the key is out of BUDGET
+//     (429/402) may escalate the bench; a malformed request or a dead model
+//     says nothing about remaining quota, and with PER_KEY_RETRIES attempts it
+//     could otherwise walk the counter three at a time into a 24h quarantine
+//     of a perfectly healthy key. The ladder half is pinned in
+//     services/ratelimit.test.ts, where the counter can be driven exactly.
+//     (card c4406)
 
 const chatCompletion = vi.fn();
 const streamChatCompletion = vi.fn();
@@ -129,20 +137,31 @@ describe('Usage limiter accounting under failure and retry', () => {
     setGlobalRetryLimit(3);          // bounds the loop: 3 upstream attempts, no 1-RPM sleeps
   });
 
-  // ── Defect 1: the ledger must move on failed attempts the provider SERVED ──
-  it('counts attempts the provider served, even when every one failed', async () => {
-    chatCompletion.mockRejectedValue(SERVER_ERROR);
+  // ── Defect 1: the ledger must move on failed attempts ──
+  it('counts attempts that reached the provider even when every one is rejected', async () => {
+    chatCompletion.mockRejectedValue(RATE_LIMITED);
 
     const { status } = await post(app, '/v1/chat/completions', {
       messages: [{ role: 'user', content: 'hi' }],
     }, key);
 
-    expect(status).toBeGreaterThanOrEqual(400);
+    expect(status).toBe(429);
     expect(chatCompletion).toHaveBeenCalledTimes(3);
-    // The provider accepted all three and broke serving them, so all three
-    // count against its request quota. Recording only successes left this at
-    // 0 — the limiter saw a completely idle key while the gateway hammered a
-    // provider that was already failing.
+    // Every one of those three attempts was accepted and rejected by the
+    // provider, so all three count against its request quota. Recording only
+    // successes left this at 0 — the limiter saw a completely idle key while
+    // the gateway hammered a provider that was already saying no.
+    expect(providerDailyRequestCount(PLATFORM, keyId)).toBe(3);
+  });
+
+  it('counts a failure the provider accepted and broke serving', async () => {
+    chatCompletion.mockRejectedValue(SERVER_ERROR);
+
+    await post(app, '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'hi' }],
+    }, key);
+
+    expect(chatCompletion).toHaveBeenCalledTimes(3);
     expect(providerDailyRequestCount(PLATFORM, keyId)).toBe(3);
   });
 
@@ -159,25 +178,25 @@ describe('Usage limiter accounting under failure and retry', () => {
     expect(providerDailyRequestCount(PLATFORM, keyId)).toBe(0);
   });
 
-  // ── Defect 3: a REFUSAL is not a purchase ──
-  it('does not bill a 429, but still rests the key for it', async () => {
-    chatCompletion.mockRejectedValue(RATE_LIMITED);
+  // ── Defect 3: refusals are BILLED (the counter), but only budget-shaped
+  //    ones may escalate the bench (the ladder). Two questions, not one. ──
+  it('bills a request-shaped refusal, but does not rest the key over it', async () => {
+    // A 400 is our own bad call, not evidence about the key. It reached the
+    // provider, so it is billed like anything else that left the box — but the
+    // key is healthy, so providerAtFault keeps it unbenched, and the ladder
+    // gating (pinned in services/ratelimit.test.ts, where the daily counter can
+    // be driven exactly) keeps a burst of these from quarantining it for a day.
+    chatCompletion.mockRejectedValue(
+      Object.assign(new Error('flaky API error 400: unsupported parameter'), { status: 400 }),
+    );
 
-    const { status } = await post(app, '/v1/chat/completions', {
+    await post(app, '/v1/chat/completions', {
       messages: [{ role: 'user', content: 'hi' }],
     }, key);
 
-    expect(status).toBe(429);
     expect(chatCompletion).toHaveBeenCalledTimes(3);
-    // The provider declined to do the work because we were over a limit — it
-    // did not spend the account's daily quota on our behalf. Billing it moved
-    // this counter by 3 for ONE refused request, and this counter is what
-    // getCooldownDurationForLimit reads to call a 429 "daily exhaustion" and
-    // promote a 90s rest onto the ladder that ends at 24h.
-    expect(providerDailyRequestCount(PLATFORM, keyId)).toBe(0);
-    // Crucially the back-off itself is untouched: not billing a refusal must
-    // not mean ignoring it. That is the cooldown's job, and it still happens.
-    expect(isOnCooldown(PLATFORM, MODEL_ID, keyId)).toBe(true);
+    expect(providerDailyRequestCount(PLATFORM, keyId)).toBe(3);
+    expect(isOnCooldown(PLATFORM, MODEL_ID, keyId)).toBe(false);
   });
 
   it('bills a /v1/messages turn that died after the provider streamed real bytes', async () => {

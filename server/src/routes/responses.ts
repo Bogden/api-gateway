@@ -11,7 +11,7 @@ import type {
 } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, hasEnabledVisionModel, type RouteResult } from '../services/router.js';
 import { recordRequest, recordFailedRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
-import { attemptConsumedQuota, providerAtFault, isRetryableError, isPaymentRequiredError } from '../lib/error-classify.js';
+import { attemptReachedProvider, indicatesQuotaExhaustion, providerAtFault, isRetryableError, isPaymentRequiredError } from '../lib/error-classify.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -674,7 +674,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           if (rescue.detected && !rescue.calls) {
             logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, `unparseable inline tool-call dialect: ${heldText.slice(0, 120)}`);
             skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-            setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+            setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, null, /* quotaEvidence */ false));
             recordRateLimitHit(route.modelDbId);
             lastError = new Error(`unparseable inline tool-call dialect from ${route.displayName}`);
             continue;
@@ -715,7 +715,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         if (msgText.length === 0 && toolAcc.size === 0) {
           logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, null, /* quotaEvidence */ false));
           recordRateLimitHit(route.modelDbId);
           lastError = new Error(`empty completion from ${route.displayName}`);
           continue;
@@ -788,7 +788,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         if (!text && toolCalls.length === 0) {
           logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, null, /* quotaEvidence */ false));
           recordRateLimitHit(route.modelDbId);
           lastError = new Error(`empty completion from ${route.displayName}`);
           continue;
@@ -830,11 +830,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
 
       // Failed attempts count against the provider's quota too — see
-      // recordFailedRequest. Skipped when nothing reached the provider, and
-      // also when the provider REFUSED the request rather than serving it
-      // (429/402/403/401): billing a refusal moves the daily counter that
-      // decides a 24h quarantine. Backing off is the cooldown's job below.
-      if (attemptConsumedQuota(err)) {
+      // recordFailedRequest. Refusals included: the provider saw the request
+      // and may well have counted it, and undercounting silently overruns a
+      // real budget. Only a failure that never left the box is skipped.
+      // Whether the failure also escalates the BENCH is a separate question,
+      // answered by indicatesQuotaExhaustion at the cooldown below.
+      if (attemptReachedProvider(err)) {
         recordFailedRequest(route.platform, route.modelId, route.keyId);
       }
 
@@ -858,6 +859,11 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             isPaymentRequiredError(err),
             route.platform, route.modelId, route.keyId,
             { rpd: route.rpdLimit, tpd: route.tpdLimit },
+            err?.retryAfterMs,
+            // Escalate onto the daily ladder only when the failure actually
+            // says the key is out of budget — not when our own request was
+            // wrong, and not for a dead turn. (card c4406)
+            indicatesQuotaExhaustion(err),
           ));
         }
         recordRateLimitHit(route.modelDbId);
