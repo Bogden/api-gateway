@@ -269,14 +269,25 @@ export function recordRequest(platform: string, modelId: string, keyId: number) 
   markKeyHealthyFromRequest(keyId);
 }
 
-/** Count an attempt that REACHED the provider and came back a failure (429,
- *  4xx/5xx, or a 200 whose turn was dead). The provider charged its request
- *  quota for it exactly like a success, so the rpm/rpd windows and the
- *  provider-wide daily cap must move — recording only successes makes the
- *  limiter go blind precisely when a provider starts rejecting us, and it keeps
- *  sending. Callers gate this on `attemptReachedProvider` so a failure that
- *  never left the box (client abort, connection refused, DNS/transport death)
- *  is not charged to the provider.
+/** Count an attempt the provider actually SERVED and that came back a failure
+ *  (a 5xx, a 400/422 it parsed and rejected, or a 200 whose turn was dead). The
+ *  provider charged its request quota for it exactly like a success, so the
+ *  rpm/rpd windows and the provider-wide daily cap must move — recording only
+ *  successes makes the limiter go blind precisely when a provider starts
+ *  failing us, and it keeps sending.
+ *
+ *  Callers gate this on `attemptConsumedQuota`, which excludes two things. A
+ *  failure that never left the box (client abort, connection refused,
+ *  DNS/transport death, a cooldown we imposed ourselves) obviously spent
+ *  nothing. Less obviously, so did a request the provider REFUSED at the gate
+ *  rather than served — 429/402/403/401. Free tiers do not generally bill a
+ *  refusal, and charging one is worse than imprecise: the retry loop makes
+ *  PER_KEY_RETRIES attempts, so a single refused request moved this ledger
+ *  three times, and this ledger is what `getCooldownDurationForLimit` reads to
+ *  decide a 429 means DAILY exhaustion — promoting a 90s rest onto the
+ *  2m→10m→1h→24h ladder and, via `canUseProvider`, skipping every model on the
+ *  provider. That quarantined keys on usage that never happened. Backing off
+ *  from a refusal is the cooldown's job, not this ledger's. (card c4406)
  *
  *  Unlike `recordRequest` this does NOT promote the key to 'healthy': a
  *  rejected call is no evidence the key works. Tokens are deliberately not

@@ -104,6 +104,10 @@ type ResponsesInputItem =
 class ChatGptTranslationError extends Error {
   readonly status = 400;
   readonly retryable = false;
+  // Thrown while BUILDING the request, before anything is dispatched. The 400
+  // above is ours, not a provider's answer, so the limiter must not bill the
+  // account's quota for it — see attemptReachedProvider. (card c4406)
+  readonly reachedProvider = false;
 
   constructor(message: string) {
     super(`ChatGPT Responses translation rejected input: ${message}`);
@@ -359,6 +363,12 @@ export class ChatGptProvider extends BaseProvider {
     ) as ProviderHttpError;
     err.status = 429;
     (err as ProviderHttpError & { code?: string }).code = 'CHATGPT_COOLDOWN';
+    // This guard exists precisely to AVOID contacting the plan, so the 429 is
+    // self-imposed and no provider quota was spent. Without this marker the
+    // limiter charged the account for every request the cooldown blocked —
+    // inflating the daily counter hardest while the plan was already
+    // throttled, which is when that counter matters most. (card c4406)
+    (err as ProviderHttpError & { reachedProvider?: boolean }).reachedProvider = false;
     return err;
   }
 
