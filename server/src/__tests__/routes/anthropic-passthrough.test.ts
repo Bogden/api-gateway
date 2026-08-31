@@ -2,6 +2,7 @@ import { afterAll, beforeAll, afterEach, describe, expect, it, vi } from 'vitest
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb } from '../../db/index.js';
+import { _resetChatgptCooldowns, setChatgptCooldown } from '../../services/chatgpt-cooldown.js';
 
 const UPSTREAM_URL = 'https://api.anthropic.com/v1/messages';
 
@@ -41,7 +42,10 @@ describe('native Anthropic opt-in passthrough', () => {
     app = createApp();
   });
 
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    _resetChatgptCooldowns();
+  });
   afterAll(() => vi.restoreAllMocks());
 
   it('forwards the exact body, caller credential, version, beta, and cache usage', async () => {
@@ -92,6 +96,31 @@ describe('native Anthropic opt-in passthrough', () => {
     expect(await response.text()).toBe(sse);
     const row = getDb().prepare("SELECT * FROM requests WHERE platform = 'anthropic-passthrough' ORDER BY id DESC LIMIT 1").get() as any;
     expect(row).toMatchObject({ input_tokens: 20, output_tokens: 4, cache_read_input_tokens: 15, status: 'success' });
+  });
+
+  it('routes opted-in luna to native haiku only while its ChatGPT model is cooling down', async () => {
+    const body = JSON.stringify({ model: 'gpt-5.6-luna', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] });
+    setChatgptCooldown('gpt-5.6-luna', 60_000, 'window exhausted');
+    mockAnthropic(async init => {
+      expect(JSON.parse(String(init?.body))).toMatchObject({ model: 'claude-haiku-4-5-20251001' });
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer caller-oauth');
+      return new Response(JSON.stringify({
+        id: 'msg_fallback', type: 'message', role: 'assistant', model: 'claude-haiku-4-5-20251001',
+        content: [{ type: 'text', text: 'haiku' }], stop_reason: 'end_turn',
+        usage: { input_tokens: 5, output_tokens: 2 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+
+    const response = await request(app, body, {
+      authorization: 'Bearer caller-oauth',
+      'anthropic-version': '2023-06-01',
+      'x-api-gateway-anthropic-passthrough': '1',
+    });
+
+    expect(response.status).toBe(200);
+    expect((await response.json() as any).model).toBe('claude-haiku-4-5-20251001');
+    const row = getDb().prepare("SELECT * FROM requests WHERE platform = 'anthropic-passthrough-chatgpt-exhausted' ORDER BY id DESC LIMIT 1").get() as any;
+    expect(row).toMatchObject({ model_id: 'claude-haiku-4-5-20251001', requested_model: 'gpt-5.6-luna', status: 'success' });
   });
 
   it('does not passthrough without the exact opt-in or for a non-Claude model', async () => {
