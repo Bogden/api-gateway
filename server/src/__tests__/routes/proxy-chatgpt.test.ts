@@ -5,7 +5,7 @@ import os from 'os';
 import path from 'path';
 import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
-import { _resetChatgptCooldowns } from '../../services/chatgpt-cooldown.js';
+import { _resetChatgptCooldowns, setChatgptCooldown } from '../../services/chatgpt-cooldown.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 import { setClaudeModelMap } from '../../services/anthropic-map.js';
 import { ensureChatgptModel } from '../../routes/proxy.js';
@@ -140,6 +140,51 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
       WHERE m.platform = 'chatgpt' AND fc.enabled = 1
     `).get() as { n: number };
     expect(inChain.n).toBe(0);
+  });
+
+  it('keeps healthy opted-in luna traffic on chatgpt', async () => {
+    ensureChatgptModel(getDb(), 'gpt-5.6-luna');
+    mockCodex(() => ({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({
+        id: 'resp_luna',
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'luna' }] }],
+        usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 },
+      }),
+    }));
+
+    const res = await request(
+      app,
+      'POST',
+      '/v1/messages',
+      { model: 'gpt-5.6-luna', max_tokens: 100, messages: [{ role: 'user', content: 'ping' }], stream: false },
+      { Authorization: 'Bearer caller-anthropic-oauth', 'x-api-gateway-anthropic-passthrough': '1' },
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers['x-routed-via']).toBe('chatgpt/gpt-5.6-luna');
+    expect(res.body.content).toEqual([{ type: 'text', text: 'luna' }]);
+  });
+
+  it('keeps exhausted luna traffic without opt-in on the existing visible-error path', async () => {
+    ensureChatgptModel(getDb(), 'gpt-5.6-luna');
+    setChatgptCooldown('gpt-5.6-luna', 60_000, 'window exhausted');
+    const codex = vi.fn();
+    mockCodex(codex);
+
+    const res = await request(
+      app,
+      'POST',
+      '/v1/messages',
+      { model: 'gpt-5.6-luna', max_tokens: 100, messages: [{ role: 'user', content: 'ping' }], stream: false },
+      xApiKeyHeaders(),
+    );
+
+    expect(res.status).toBe(429);
+    expect(res.text).toContain('window exhausted');
+    expect(codex).not.toHaveBeenCalled();
   });
 
   it('maps cached input usage on a non-streaming Anthropic response', async () => {

@@ -23,6 +23,7 @@ import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModel
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, isAuthorizedV1Request, getStickyModel, setStickyModel } from './proxy.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
+import { isChatgptCoolingDown } from '../services/chatgpt-cooldown.js';
 
 // Anthropic-compatible Messages API (`POST /v1/messages`). This is a thin
 // translation layer over the SAME router/fallback/analytics machinery the
@@ -46,6 +47,9 @@ const IMAGE_TOKEN_ESTIMATE = 1000;
 const ANTHROPIC_PASSTHROUGH_HEADER = 'x-api-gateway-anthropic-passthrough';
 const ANTHROPIC_API_MESSAGES_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_PASSTHROUGH_PLATFORM = 'anthropic-passthrough';
+const CHATGPT_EXHAUSTED_PASSTHROUGH_PLATFORM = 'anthropic-passthrough-chatgpt-exhausted';
+const LUNA_MODEL = 'gpt-5.6-luna';
+const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 
 const HOP_BY_HOP_HEADERS = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -57,10 +61,22 @@ function firstHeader(req: Request, name: string): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
+function hasAnthropicPassthroughOptIn(req: Request): boolean {
+  return firstHeader(req, ANTHROPIC_PASSTHROUGH_HEADER)?.trim() === '1';
+}
+
 function wantsAnthropicPassthrough(req: Request, model: unknown): boolean {
-  return firstHeader(req, ANTHROPIC_PASSTHROUGH_HEADER)?.trim() === '1'
+  return hasAnthropicPassthroughOptIn(req)
     && typeof model === 'string'
     && /^claude-/i.test(model);
+}
+
+// Operator-authorized exhaustion fallback (card c6472). Ordinary ChatGPT
+// request errors remain visible; only the already-armed cooldown enables it.
+function wantsExhaustedLunaFallback(req: Request, model: unknown): boolean {
+  return hasAnthropicPassthroughOptIn(req)
+    && model === LUNA_MODEL
+    && isChatgptCoolingDown(LUNA_MODEL);
 }
 
 function passthroughRequestHeaders(req: Request): Headers {
@@ -97,18 +113,28 @@ function normalizeUsage(value: unknown): Required<AnthropicUsage> {
   return mergeUsage({ input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 }, value);
 }
 
-async function passthroughAnthropicRequest(req: Request, res: Response, start: number): Promise<void> {
-  const model = String(req.body.model);
+async function passthroughAnthropicRequest(
+  req: Request,
+  res: Response,
+  start: number,
+  override?: { model: string; platform: string },
+): Promise<void> {
+  const requestedModel = String(req.body.model);
+  const model = override?.model ?? requestedModel;
+  const platform = override?.platform ?? ANTHROPIC_PASSTHROUGH_PLATFORM;
+  const body = override
+    ? JSON.stringify({ ...req.body, model })
+    : (req as Request & { rawBody?: Buffer }).rawBody ?? JSON.stringify(req.body);
   let upstream: globalThis.Response;
   try {
     upstream = await fetch(ANTHROPIC_API_MESSAGES_URL, {
       method: 'POST',
       headers: passthroughRequestHeaders(req),
-      body: (req as Request & { rawBody?: Buffer }).rawBody ?? JSON.stringify(req.body),
+      body,
     });
   } catch (err: any) {
     const message = sanitizeProviderErrorMessage(err?.message ?? 'Anthropic upstream request failed');
-    logRequest(ANTHROPIC_PASSTHROUGH_PLATFORM, model, null, 'error', 0, 0, Date.now() - start, message, null, model);
+    logRequest(platform, model, null, 'error', 0, 0, Date.now() - start, message, null, requestedModel);
     sendError(res, 502, 'api_error', message);
     return;
   }
@@ -125,13 +151,13 @@ async function passthroughAnthropicRequest(req: Request, res: Response, start: n
       const payload = JSON.parse(bytes.toString('utf8'));
       usage = normalizeUsage(payload?.usage);
     } catch {}
-    logRequest(ANTHROPIC_PASSTHROUGH_PLATFORM, model, null, upstream.ok ? 'success' : 'error', usage.input_tokens, usage.output_tokens, Date.now() - start, upstream.ok ? null : bytes.toString('utf8').slice(0, 1000), null, model, usage.cache_read_input_tokens);
+    logRequest(platform, model, null, upstream.ok ? 'success' : 'error', usage.input_tokens, usage.output_tokens, Date.now() - start, upstream.ok ? null : bytes.toString('utf8').slice(0, 1000), null, requestedModel, usage.cache_read_input_tokens);
     res.send(bytes);
     return;
   }
 
   if (!upstream.body) {
-    logRequest(ANTHROPIC_PASSTHROUGH_PLATFORM, model, null, 'error', 0, 0, Date.now() - start, 'Anthropic upstream returned an empty stream', null, model);
+    logRequest(platform, model, null, 'error', 0, 0, Date.now() - start, 'Anthropic upstream returned an empty stream', null, requestedModel);
     res.end();
     return;
   }
@@ -156,7 +182,7 @@ async function passthroughAnthropicRequest(req: Request, res: Response, start: n
     }
   }
   res.end();
-  logRequest(ANTHROPIC_PASSTHROUGH_PLATFORM, model, null, upstream.ok ? 'success' : 'error', usage.input_tokens, usage.output_tokens, Date.now() - start, upstream.ok ? null : `Anthropic upstream returned HTTP ${upstream.status}`, null, model, usage.cache_read_input_tokens);
+  logRequest(platform, model, null, upstream.ok ? 'success' : 'error', usage.input_tokens, usage.output_tokens, Date.now() - start, upstream.ok ? null : `Anthropic upstream returned HTTP ${upstream.status}`, null, requestedModel, usage.cache_read_input_tokens);
 }
 
 // ── Request schema ──────────────────────────────────────────────────────────
@@ -458,6 +484,13 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
 
   if (wantsAnthropicPassthrough(req, req.body?.model)) {
     await passthroughAnthropicRequest(req, res, start);
+    return;
+  }
+  if (wantsExhaustedLunaFallback(req, req.body?.model)) {
+    await passthroughAnthropicRequest(req, res, start, {
+      model: HAIKU_MODEL,
+      platform: CHATGPT_EXHAUSTED_PASSTHROUGH_PLATFORM,
+    });
     return;
   }
 
