@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { createHash } from 'crypto';
 import { ChatGptProvider } from '../../providers/chatgpt.js';
 import { codexAuthPath } from '../../lib/codex-auth.js';
 import {
@@ -213,6 +214,54 @@ describe('ChatGptProvider', () => {
     expect(bodies[2].prompt_cache_key).not.toBe(bodies[0].prompt_cache_key);
     expect(bodies[0].prompt_cache_retention).toBeUndefined();
     expect(bodies[0].previous_response_id).toBeUndefined();
+  });
+
+  it('keeps session id and cache key stable per conversation key, and distinct across keys', async () => {
+    writeLogin();
+    const calls: Array<{ body: any; headers: any }> = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      calls.push({ body: JSON.parse((init as any).body), headers: (init as any).headers });
+      return sseResponse([
+        'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
+      ]);
+    });
+
+    const tools = [{ type: 'function' as const, function: { name: 'shell', description: 'run', parameters: { type: 'object' } } }];
+    const turn = (userText: string, prompt_cache_key?: string) =>
+      collect(provider.streamChatCompletion(
+        'no-key',
+        [{ role: 'system', content: 'be terse' }, { role: 'user', content: userText }],
+        'gpt-5-codex',
+        { tools, ...(prompt_cache_key ? { prompt_cache_key } : {}) },
+      ));
+
+    // Same conversation key, two different turns.
+    await turn('first turn', 'ccrun:abc');
+    await turn('second turn', 'ccrun:abc');
+    // A different conversation, identical instructions + tools.
+    await turn('first turn', 'ccrun:xyz');
+    // No caller key at all — legacy behavior.
+    await turn('first turn');
+
+    const [a, b, c, legacy] = calls;
+    expect(a.body.prompt_cache_key).toMatch(/^[a-f0-9]{64}$/);
+    expect(b.body.prompt_cache_key).toBe(a.body.prompt_cache_key);
+    expect(a.headers.session_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(b.headers.session_id).toBe(a.headers.session_id);
+
+    expect(c.body.prompt_cache_key).not.toBe(a.body.prompt_cache_key);
+    expect(c.headers.session_id).not.toBe(a.headers.session_id);
+
+    // No caller key → the old system-and-tools prefix hash, unchanged.
+    expect(legacy.body.prompt_cache_key).toBe(
+      createHash('sha256')
+        .update(JSON.stringify({
+          instructions: 'be terse',
+          tools: [{ type: 'function', name: 'shell', description: 'run', parameters: { type: 'object' } }],
+        }))
+        .digest('hex'),
+    );
+    expect(legacy.body.prompt_cache_key).not.toBe(a.body.prompt_cache_key);
   });
 
   it('fails fast on a deterministic 400 (marked non-retryable, upstream error passed through)', async () => {

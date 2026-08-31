@@ -60,6 +60,12 @@ export interface CompletionOptions {
   // Richer thinking-control object. Providers translate into their native
   // vocab (`thinking`, `thinkingConfig`, `reasoning_effort`). See #290.
   thinking?: import('@api-gateway/shared/types.js').ThinkingConfig;
+  /** Caller-supplied conversation cache key (OpenAI's `prompt_cache_key`).
+   *  Providers that route on cache affinity (the ChatGPT/Codex Responses
+   *  backend) mix it into the upstream cache key and into a per-conversation
+   *  session id, so every request of one conversation lands on the same cache
+   *  shard. Providers with no such control ignore it. (card c3025) */
+  prompt_cache_key?: string;
   /** Per-call HTTP timeout override. Not part of the OpenAI wire format (it is
    * stripped before the request body is built); used by the probe script so
    * NVIDIA's 15-60s serverless cold starts don't read as failures. */
