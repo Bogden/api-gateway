@@ -65,7 +65,14 @@ export function createApp() {
   // 10mb: code agents (OpenCode, AionUI, Qwen Code) ship very large system
   // prompts + tool schemas + repo context; 1mb cut their sessions off
   // mid-conversation with an opaque 413. (#200)
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({
+    limit: '10mb',
+    verify(req, _res, buf) {
+      if (req.url === '/v1/messages' && req.headers['x-api-gateway-anthropic-passthrough'] === '1') {
+        (req as express.Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf);
+      }
+    },
+  }));
 
   // Dashboard auth (#35): /api/auth/{status,setup,login} bootstrap without a
   // session; everything else under /api/* requires a logged-in dashboard user.

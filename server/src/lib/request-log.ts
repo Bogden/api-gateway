@@ -8,7 +8,7 @@ import { pruneRequestAnalytics } from '../services/request-retention.js';
 export function logRequest(
   platform: string,
   modelId: string,
-  keyId: number,
+  keyId: number | null,
   status: string,
   inputTokens: number,
   outputTokens: number,

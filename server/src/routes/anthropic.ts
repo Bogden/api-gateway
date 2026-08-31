@@ -43,6 +43,121 @@ const MAX_RETRIES = 20;
 // default when a client somehow omits it.
 const DEFAULT_MAX_TOKENS = 1024;
 const IMAGE_TOKEN_ESTIMATE = 1000;
+const ANTHROPIC_PASSTHROUGH_HEADER = 'x-api-gateway-anthropic-passthrough';
+const ANTHROPIC_API_MESSAGES_URL = 'https://api.anthropic.com/v1/messages';
+const ANTHROPIC_PASSTHROUGH_PLATFORM = 'anthropic-passthrough';
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length', 'content-encoding',
+]);
+
+function firstHeader(req: Request, name: string): string | undefined {
+  const value = req.headers[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function wantsAnthropicPassthrough(req: Request, model: unknown): boolean {
+  return firstHeader(req, ANTHROPIC_PASSTHROUGH_HEADER)?.trim() === '1'
+    && typeof model === 'string'
+    && /^claude-/i.test(model);
+}
+
+function passthroughRequestHeaders(req: Request): Headers {
+  const headers = new Headers();
+  for (const name of ['authorization', 'x-api-key', 'anthropic-version', 'anthropic-beta', 'content-type', 'accept', 'user-agent']) {
+    const value = firstHeader(req, name);
+    if (value) headers.set(name, value);
+  }
+  return headers;
+}
+
+function copyPassthroughResponseHeaders(upstream: globalThis.Response, res: Response): void {
+  upstream.headers.forEach((value, name) => {
+    if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) res.setHeader(name, value);
+  });
+}
+
+interface AnthropicUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
+function mergeUsage(current: Required<AnthropicUsage>, value: unknown): Required<AnthropicUsage> {
+  const usage = value && typeof value === 'object' ? value as AnthropicUsage : {};
+  return {
+    input_tokens: Number.isFinite(usage.input_tokens) ? Math.max(0, Number(usage.input_tokens)) : current.input_tokens,
+    output_tokens: Number.isFinite(usage.output_tokens) ? Math.max(0, Number(usage.output_tokens)) : current.output_tokens,
+    cache_read_input_tokens: Number.isFinite(usage.cache_read_input_tokens) ? Math.max(0, Number(usage.cache_read_input_tokens)) : current.cache_read_input_tokens,
+  };
+}
+
+function normalizeUsage(value: unknown): Required<AnthropicUsage> {
+  return mergeUsage({ input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 }, value);
+}
+
+async function passthroughAnthropicRequest(req: Request, res: Response, start: number): Promise<void> {
+  const model = String(req.body.model);
+  let upstream: globalThis.Response;
+  try {
+    upstream = await fetch(ANTHROPIC_API_MESSAGES_URL, {
+      method: 'POST',
+      headers: passthroughRequestHeaders(req),
+      body: (req as Request & { rawBody?: Buffer }).rawBody ?? JSON.stringify(req.body),
+    });
+  } catch (err: any) {
+    const message = sanitizeProviderErrorMessage(err?.message ?? 'Anthropic upstream request failed');
+    logRequest(ANTHROPIC_PASSTHROUGH_PLATFORM, model, null, 'error', 0, 0, Date.now() - start, message, null, model);
+    sendError(res, 502, 'api_error', message);
+    return;
+  }
+
+  res.status(upstream.status);
+  copyPassthroughResponseHeaders(upstream, res);
+  const contentType = upstream.headers.get('content-type') ?? '';
+  const isStream = Boolean(req.body.stream) || contentType.includes('text/event-stream');
+  let usage = normalizeUsage(null);
+
+  if (!isStream) {
+    const bytes = Buffer.from(await upstream.arrayBuffer());
+    try {
+      const payload = JSON.parse(bytes.toString('utf8'));
+      usage = normalizeUsage(payload?.usage);
+    } catch {}
+    logRequest(ANTHROPIC_PASSTHROUGH_PLATFORM, model, null, upstream.ok ? 'success' : 'error', usage.input_tokens, usage.output_tokens, Date.now() - start, upstream.ok ? null : bytes.toString('utf8').slice(0, 1000), null, model, usage.cache_read_input_tokens);
+    res.send(bytes);
+    return;
+  }
+
+  if (!upstream.body) {
+    logRequest(ANTHROPIC_PASSTHROUGH_PLATFORM, model, null, 'error', 0, 0, Date.now() - start, 'Anthropic upstream returned an empty stream', null, model);
+    res.end();
+    return;
+  }
+
+  const decoder = new TextDecoder();
+  let pending = '';
+  for await (const chunk of upstream.body) {
+    const bytes = Buffer.from(chunk);
+    res.write(bytes);
+    pending += decoder.decode(bytes, { stream: true });
+    const events = pending.split('\n\n');
+    pending = events.pop() ?? '';
+    for (const event of events) {
+      for (const line of event.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        try {
+          const payload = JSON.parse(line.slice(5).trim());
+          if (payload?.message?.usage) usage = mergeUsage(usage, payload.message.usage);
+          if (payload?.usage) usage = mergeUsage(usage, payload.usage);
+        } catch {}
+      }
+    }
+  }
+  res.end();
+  logRequest(ANTHROPIC_PASSTHROUGH_PLATFORM, model, null, upstream.ok ? 'success' : 'error', usage.input_tokens, usage.output_tokens, Date.now() - start, upstream.ok ? null : `Anthropic upstream returned HTTP ${upstream.status}`, null, model, usage.cache_read_input_tokens);
+}
 
 // ── Request schema ──────────────────────────────────────────────────────────
 // Permissive on purpose: the Anthropic content-block vocabulary grows over
@@ -340,6 +455,11 @@ function cooldownFor(route: RouteResult, err: any): number {
 anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   const start = Date.now();
   if (!authenticate(req, res)) return;
+
+  if (wantsAnthropicPassthrough(req, req.body?.model)) {
+    await passthroughAnthropicRequest(req, res, start);
+    return;
+  }
 
   const parsed = messagesSchema.safeParse(req.body);
   if (!parsed.success) {
