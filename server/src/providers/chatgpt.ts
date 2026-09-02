@@ -134,6 +134,25 @@ function toolResultInput(content: ChatMessage['content']): ToolResultInput {
   return { text: text.filter(Boolean).join('\n'), images };
 }
 
+function userContentParts(content: ChatMessage['content']): ResponsesInputContentPart[] {
+  if (!Array.isArray(content)) return [{ type: 'input_text', text: contentToString(content) }];
+
+  const parts: ResponsesInputContentPart[] = [];
+  for (const part of content) {
+    if (typeof part === 'string') {
+      parts.push({ type: 'input_text', text: part });
+      continue;
+    }
+    const url = imageUrlFromBlock(part as Record<string, unknown>);
+    if (url) {
+      parts.push({ type: 'input_image', image_url: url });
+    } else if (typeof part.text === 'string' && (part.type === 'text' || part.type === undefined)) {
+      parts.push({ type: 'input_text', text: part.text });
+    }
+  }
+  return parts;
+}
+
 export class ChatGptProvider extends BaseProvider {
   readonly platform: Platform = 'chatgpt';
   readonly name = 'ChatGPT (Codex subscription)';
@@ -229,11 +248,13 @@ export class ChatGptProvider extends BaseProvider {
         }
         continue;
       }
-      // user (and any other non-system role) → input_text message
+      // user (and any other non-system role) → Responses message parts.
+      // Claude Code may replay a Read image as a standalone user image block on
+      // the following turn; preserve it just like a deferred tool-result carrier.
       input.push({
         type: 'message',
         role: 'user',
-        content: [{ type: 'input_text', text: contentToString(m.content ?? '') }],
+        content: userContentParts(m.content ?? ''),
       });
     }
 

@@ -203,6 +203,41 @@ describe('ChatGptProvider', () => {
     expect(capturedBody.parallel_tool_calls).toBe(true);
   });
 
+  it('preserves a replayed standalone user image from a real Agent Read turn', async () => {
+    writeLogin();
+    let capturedBody: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return sseResponse([
+        'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
+      ]);
+    });
+
+    await collect(provider.streamChatCompletion(
+      'no-key',
+      [
+        { role: 'user', content: 'read the image' },
+        {
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,REAL_AGENT_READ' } },
+          ],
+        },
+      ],
+      'gpt-5.6-luna',
+      {},
+    ));
+
+    expect(capturedBody.input).toEqual([
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'read the image' }] },
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_image', image_url: 'data:image/png;base64,REAL_AGENT_READ' }],
+      },
+    ]);
+  });
+
   it('remaps minimal reasoning effort to low on codex models, but not on other models', async () => {
     writeLogin();
     const bodies: any[] = [];
