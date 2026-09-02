@@ -364,26 +364,35 @@ describe('ChatGptProvider', () => {
     expect(finishChunk.choices[0]?.finish_reason).toBe('tool_calls');
   });
 
-  it('extracts text + usage from a non-streaming completion', async () => {
+  it('aggregates a streamed response into a non-streaming completion', async () => {
     writeLogin();
-    vi.spyOn(global, 'fetch').mockResolvedValue({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      json: async () => ({
-        id: 'resp_1',
-        output: [{ type: 'message', content: [{ type: 'output_text', text: 'hello world' }] }],
-        usage: {
-          input_tokens: 5,
-          input_tokens_details: { cached_tokens: 3 },
-          output_tokens: 2,
-          total_tokens: 7,
-        },
-      }),
-    } as any);
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse(String(init?.body));
+      return sseResponse([
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1"}}\n\n',
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello "}\n\n',
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"world"}\n\n',
+        'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"get_weather"}}\n\n',
+        'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\\"city\\":"}\n\n',
+        'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"\\"paris\\"}"}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":3},"output_tokens":2,"total_tokens":7}}}\n\n',
+      ]) as any;
+    });
 
     const res = await provider.chatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5');
-    expect(res.choices[0]?.message.content).toBe('hello world');
+    expect(capturedBody.stream).toBe(true);
+    expect(res.id).toBe('resp_1');
+    expect(res.choices[0]?.message).toEqual({
+      role: 'assistant',
+      content: 'hello world',
+      tool_calls: [{
+        id: 'call_abc',
+        type: 'function',
+        function: { name: 'get_weather', arguments: '{"city":"paris"}' },
+      }],
+    });
+    expect(res.choices[0]?.finish_reason).toBe('tool_calls');
     expect(res.usage).toEqual({
       prompt_tokens: 2,
       completion_tokens: 2,
@@ -456,16 +465,12 @@ describe('ChatGptProvider', () => {
 
   it('captures the plan-usage snapshot from response headers on a non-streaming turn', async () => {
     writeLogin();
-    vi.spyOn(global, 'fetch').mockResolvedValue({
-      ok: true,
-      status: 200,
-      headers: usageHeaders({ 'x-codex-primary-used-percent': '55' }),
-      json: async () => ({
-        id: 'resp_1',
-        output: [{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }],
-        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-      }),
-    } as any);
+    const res = sseResponse([
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+    ]);
+    res.headers = usageHeaders({ 'x-codex-primary-used-percent': '55' });
+    vi.spyOn(global, 'fetch').mockResolvedValue(res as any);
 
     await provider.chatCompletion('no-key', [{ role: 'user', content: 'hi' }], 'gpt-5');
     const snaps = getChatgptUsageSnapshots();
