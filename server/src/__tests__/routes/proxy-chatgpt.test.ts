@@ -154,6 +154,8 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
     expect(res.status).toBe(200);
     expect(res.headers['x-routed-via']).toBe('chatgpt/gpt-5.6-luna');
     expect(res.body.content).toEqual([{ type: 'text', text: 'luna' }]);
+    const row = getDb().prepare("SELECT * FROM requests WHERE platform = 'chatgpt' AND model_id = 'gpt-5.6-luna' ORDER BY id DESC LIMIT 1").get() as any;
+    expect(row).toMatchObject({ platform: 'chatgpt', model_id: 'gpt-5.6-luna', requested_model: 'gpt-5.6-luna', status: 'success' });
   });
 
   it('keeps exhausted luna traffic without opt-in on the existing visible-error path', async () => {

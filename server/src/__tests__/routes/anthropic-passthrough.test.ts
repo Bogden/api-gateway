@@ -119,7 +119,7 @@ describe('native Anthropic opt-in passthrough', () => {
 
     expect(response.status).toBe(200);
     expect((await response.json() as any).model).toBe('claude-haiku-4-5-20251001');
-    const row = getDb().prepare("SELECT * FROM requests WHERE platform = 'anthropic-passthrough-chatgpt-exhausted' ORDER BY id DESC LIMIT 1").get() as any;
+    const row = getDb().prepare("SELECT * FROM requests WHERE platform = 'anthropic-passthrough' AND model_id = 'claude-haiku-4-5-20251001' ORDER BY id DESC LIMIT 1").get() as any;
     expect(row).toMatchObject({ model_id: 'claude-haiku-4-5-20251001', requested_model: 'gpt-5.6-luna', status: 'success' });
   });
 

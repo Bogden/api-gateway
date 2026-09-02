@@ -47,7 +47,11 @@ const IMAGE_TOKEN_ESTIMATE = 1000;
 const ANTHROPIC_PASSTHROUGH_HEADER = 'x-api-gateway-anthropic-passthrough';
 const ANTHROPIC_API_MESSAGES_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_PASSTHROUGH_PLATFORM = 'anthropic-passthrough';
-const CHATGPT_EXHAUSTED_PASSTHROUGH_PLATFORM = 'anthropic-passthrough-chatgpt-exhausted';
+// Keep fallback usage on the same authoritative passthrough provider seam. The
+// requested Luna alias remains in requested_model, while model records the
+// actual model that answered (Haiku), so cost/cache analytics do not invent a
+// provider for the substitution.
+const CHATGPT_EXHAUSTED_PASSTHROUGH_PLATFORM = ANTHROPIC_PASSTHROUGH_PLATFORM;
 const LUNA_MODEL = 'gpt-5.6-luna';
 const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 
