@@ -145,6 +145,64 @@ describe('ChatGptProvider', () => {
     expect(capturedBody.top_p).toBe(0.9);
   });
 
+  it('carries tool-result images after contiguous parallel outputs', async () => {
+    writeLogin();
+    let capturedBody: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return sseResponse([
+        'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
+      ]);
+    });
+
+    await collect(provider.streamChatCompletion(
+      'no-key',
+      [
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            { id: 'call_1', type: 'function', function: { name: 'Read', arguments: '{"file_path":"/tmp/one.png"}' } },
+            { id: 'call_2', type: 'function', function: { name: 'Read', arguments: '{"file_path":"/tmp/two.txt"}' } },
+          ],
+        },
+        {
+          role: 'tool',
+          tool_call_id: 'call_1',
+          content: [
+            { type: 'text', text: 'first image' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'call_2', content: 'second result' },
+        { role: 'user', content: 'continue' },
+      ],
+      'gpt-5.6-luna',
+      { parallel_tool_calls: true },
+    ));
+
+    expect(capturedBody.input).toEqual([
+      { type: 'function_call', call_id: 'call_1', name: 'Read', arguments: '{"file_path":"/tmp/one.png"}' },
+      { type: 'function_call', call_id: 'call_2', name: 'Read', arguments: '{"file_path":"/tmp/two.txt"}' },
+      {
+        type: 'function_call_output',
+        call_id: 'call_1',
+        output: 'first image\n[image result — see the following message]',
+      },
+      { type: 'function_call_output', call_id: 'call_2', output: 'second result' },
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Tool result images for tool_call_id call_1:' },
+          { type: 'input_image', image_url: 'data:image/png;base64,AAAA' },
+        ],
+      },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] },
+    ]);
+    expect(capturedBody.parallel_tool_calls).toBe(true);
+  });
+
   it('remaps minimal reasoning effort to low on codex models, but not on other models', async () => {
     writeLogin();
     const bodies: any[] = [];

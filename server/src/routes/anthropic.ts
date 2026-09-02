@@ -287,22 +287,6 @@ function flattenSystem(system: AnthropicRequest['system']): string {
     .join('\n');
 }
 
-// An Anthropic tool_result's content is a string or an array of blocks; flatten
-// to text for the internal `tool` message (we don't forward tool images).
-function flattenToolResult(content: unknown): string {
-  if (content == null) return '';
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return JSON.stringify(content);
-  return content
-    .map(block => {
-      if (typeof block === 'string') return block;
-      if (block && typeof block === 'object' && typeof (block as any).text === 'string') return (block as any).text;
-      return '';
-    })
-    .filter(Boolean)
-    .join('\n');
-}
-
 // Anthropic image block → OpenAI `image_url` block, so vision models keep
 // working through the same routing path the OpenAI route uses.
 function imageBlockToUrl(block: any): string | null {
@@ -313,6 +297,40 @@ function imageBlockToUrl(block: any): string | null {
   }
   if (src.type === 'url' && typeof src.url === 'string') return src.url;
   return null;
+}
+
+function convertToolResult(content: unknown): { content: ChatContent; hasImage: boolean } {
+  if (content == null) return { content: '', hasImage: false };
+  if (typeof content === 'string') return { content, hasImage: false };
+  if (!Array.isArray(content)) return { content: JSON.stringify(content), hasImage: false };
+
+  const blocks: ChatContentBlock[] = [];
+  let hasImage = false;
+  for (const block of content) {
+    if (typeof block === 'string') {
+      blocks.push({ type: 'text', text: block });
+      continue;
+    }
+    if (block && typeof block === 'object' && (block as any).type === 'image') {
+      const url = imageBlockToUrl(block);
+      if (url) {
+        blocks.push({ type: 'image_url', image_url: { url } } as ChatContentBlock);
+        hasImage = true;
+      }
+      continue;
+    }
+    if (block && typeof block === 'object' && typeof (block as any).text === 'string') {
+      blocks.push({ type: 'text', text: (block as any).text });
+    }
+  }
+
+  if (!hasImage) {
+    return {
+      content: blocks.map(block => typeof block === 'string' ? block : String(block.text ?? '')).filter(Boolean).join('\n'),
+      hasImage: false,
+    };
+  }
+  return { content: blocks, hasImage: true };
 }
 
 function convertToolChoice(choice: AnthropicRequest['tool_choice']): ChatToolChoice | undefined {
@@ -334,7 +352,7 @@ interface ConvertedRequest {
   wantsTools: boolean;
 }
 
-function convertRequest(input: AnthropicRequest): ConvertedRequest {
+export function convertRequest(input: AnthropicRequest): ConvertedRequest {
   const messages: ChatMessage[] = [];
   let hasImage = false;
 
@@ -379,11 +397,13 @@ function convertRequest(input: AnthropicRequest): ConvertedRequest {
           function: { name: String((block as any).name ?? ''), arguments: JSON.stringify((block as any).input ?? {}) },
         });
       } else if (type === 'tool_result') {
+        const result = convertToolResult((block as any).content);
         toolResults.push({
           role: 'tool',
           tool_call_id: String((block as any).tool_use_id ?? ''),
-          content: flattenToolResult((block as any).content),
+          content: result.content,
         });
+        if (result.hasImage) hasImage = true;
       }
       // Unknown block types (thinking, document, …) are intentionally dropped.
     }

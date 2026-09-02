@@ -92,10 +92,47 @@ interface ResponsesRequestBody {
   include: string[];
 }
 
+type ResponsesInputContentPart =
+  | { type: 'input_text' | 'output_text'; text: string }
+  | { type: 'input_image'; image_url: string };
+
 type ResponsesInputItem =
-  | { type: 'message'; role: 'user' | 'assistant'; content: Array<{ type: 'input_text' | 'output_text'; text: string }> }
+  | { type: 'message'; role: 'user' | 'assistant'; content: ResponsesInputContentPart[] }
   | { type: 'function_call'; call_id: string; name: string; arguments: string }
   | { type: 'function_call_output'; call_id: string; output: string };
+
+interface ToolResultInput {
+  text: string;
+  images: string[];
+}
+
+function imageUrlFromBlock(block: Record<string, unknown>): string | null {
+  if (block.type !== 'image_url' || !block.image_url || typeof block.image_url !== 'object' || Array.isArray(block.image_url)) {
+    return null;
+  }
+  const url = (block.image_url as { url?: unknown }).url;
+  return typeof url === 'string' && url.length > 0 ? url : null;
+}
+
+function toolResultInput(content: ChatMessage['content']): ToolResultInput {
+  if (!Array.isArray(content)) return { text: contentToString(content), images: [] };
+
+  const text: string[] = [];
+  const images: string[] = [];
+  for (const part of content) {
+    if (typeof part === 'string') {
+      text.push(part);
+      continue;
+    }
+    const url = imageUrlFromBlock(part as Record<string, unknown>);
+    if (url) {
+      images.push(url);
+    } else if (typeof part.text === 'string' && (part.type === 'text' || part.type === undefined)) {
+      text.push(part.text);
+    }
+  }
+  return { text: text.filter(Boolean).join('\n'), images };
+}
 
 export class ChatGptProvider extends BaseProvider {
   readonly platform: Platform = 'chatgpt';
@@ -131,6 +168,10 @@ export class ChatGptProvider extends BaseProvider {
   ): ResponsesRequestBody {
     const systemParts: string[] = [];
     const input: ResponsesInputItem[] = [];
+    const deferredToolImageCarriers: ResponsesInputItem[] = [];
+    const flushToolImageCarriers = () => {
+      if (deferredToolImageCarriers.length > 0) input.push(...deferredToolImageCarriers.splice(0));
+    };
     // Kill switch (card c2081): a hot-path transform on a subscription window
     // deserves a no-deploy off switch. Enabled by default.
     const compressionEnabled =
@@ -146,20 +187,33 @@ export class ChatGptProvider extends BaseProvider {
         continue;
       }
       if (m.role === 'tool') {
-        const raw = contentToString(m.content ?? '');
-        const output = compressionEnabled ? compressBlob(raw) : raw;
-        if (output.length !== raw.length) {
+        const result = toolResultInput(m.content ?? '');
+        const output = compressionEnabled ? compressBlob(result.text) : result.text;
+        if (output.length !== result.text.length) {
           blobsCompressed++;
-          charsBefore += raw.length;
+          charsBefore += result.text.length;
           charsAfter += output.length;
         }
         input.push({
           type: 'function_call_output',
           call_id: m.tool_call_id ?? '',
-          output,
+          output: result.images.length > 0
+            ? `${output}${output ? '\n' : ''}[image result — see the following message]`
+            : output,
         });
+        if (result.images.length > 0) {
+          deferredToolImageCarriers.push({
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: `Tool result images for tool_call_id ${m.tool_call_id ?? ''}:` },
+              ...result.images.map(image_url => ({ type: 'input_image' as const, image_url })),
+            ],
+          });
+        }
         continue;
       }
+      flushToolImageCarriers();
       if (m.role === 'assistant') {
         const text = contentToString(m.content ?? '');
         if (text) {
@@ -183,6 +237,7 @@ export class ChatGptProvider extends BaseProvider {
       });
     }
 
+    flushToolImageCarriers();
     const instructions = systemParts.join('\n\n') || DEFAULT_INSTRUCTIONS;
     const tools = options?.tools
       ?.filter((t) => t.type === 'function' && t.function?.name)
