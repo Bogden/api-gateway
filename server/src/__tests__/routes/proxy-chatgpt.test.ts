@@ -110,16 +110,10 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
   }
 
   it('routes a gpt-* request to the chatgpt provider and returns the completion', async () => {
-    mockCodex(() => ({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      json: async () => ({
-        id: 'resp_1',
-        output: [{ type: 'message', content: [{ type: 'output_text', text: 'pong' }] }],
-        usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 },
-      }),
-    }));
+    mockCodex(() => sseResponse([
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"pong"}\n\n',
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}\n\n',
+    ]));
 
     const res = await request(
       app,
@@ -144,16 +138,10 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
 
   it('keeps healthy opted-in luna traffic on chatgpt', async () => {
     ensureChatgptModel(getDb(), 'gpt-5.6-luna');
-    mockCodex(() => ({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      json: async () => ({
-        id: 'resp_luna',
-        output: [{ type: 'message', content: [{ type: 'output_text', text: 'luna' }] }],
-        usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 },
-      }),
-    }));
+    mockCodex(() => sseResponse([
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"luna"}\n\n',
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_luna","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}\n\n',
+    ]));
 
     const res = await request(
       app,
@@ -188,21 +176,10 @@ describe('ChatGPT provider routing (/v1/chat/completions, gpt-*)', () => {
   });
 
   it('maps cached input usage on a non-streaming Anthropic response', async () => {
-    mockCodex(() => ({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      json: async () => ({
-        id: 'resp_xak',
-        output: [{ type: 'message', content: [{ type: 'output_text', text: 'pong' }] }],
-        usage: {
-          input_tokens: 10,
-          input_tokens_details: { cached_tokens: 6 },
-          output_tokens: 1,
-          total_tokens: 11,
-        },
-      }),
-    }));
+    mockCodex(() => sseResponse([
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"pong"}\n\n',
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_xak","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":6},"output_tokens":1,"total_tokens":11}}}\n\n',
+    ]));
 
     const res = await request(
       app,

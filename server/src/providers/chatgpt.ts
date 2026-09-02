@@ -364,10 +364,49 @@ export class ChatGptProvider extends BaseProvider {
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
     this.assertNotCoolingDown(modelId);
-    const body = this.buildRequestBody(messages, modelId, options, false);
-    const res = await this.post(body, false, options?.abortSignal);
-    const json = (await res.json()) as ResponsesApiResponse;
-    return this.toCompletionResponse(json, modelId);
+    const body = this.buildRequestBody(messages, modelId, options, true);
+    const res = await this.post(body, true, options?.abortSignal);
+    let text = '';
+    const toolCalls: ChatToolCall[] = [];
+    const toolIndexByOutput = new Map<number, number>();
+    let completed: ResponsesApiResponse | undefined;
+
+    for await (const evt of this.readResponsesStream(res, modelId, options?.abortSignal)) {
+      const type = evt.type;
+      if (type === 'response.output_text.delta' && typeof evt.delta === 'string') {
+        text += evt.delta;
+      } else if (type === 'response.output_item.added' && evt.item?.type === 'function_call') {
+        const outputIndex = typeof evt.output_index === 'number' ? evt.output_index : toolCalls.length;
+        toolIndexByOutput.set(outputIndex, toolCalls.length);
+        toolCalls.push({
+          id: evt.item.call_id ?? evt.item.id ?? '',
+          type: 'function',
+          function: { name: evt.item.name ?? '', arguments: '' },
+        });
+      } else if (type === 'response.function_call_arguments.delta' && typeof evt.delta === 'string') {
+        const outputIndex = typeof evt.output_index === 'number' ? evt.output_index : 0;
+        const toolCall = toolCalls[toolIndexByOutput.get(outputIndex) ?? 0];
+        if (toolCall) toolCall.function.arguments += evt.delta;
+      } else if (type === 'response.completed') {
+        completed = evt.response as ResponsesApiResponse | undefined;
+      } else if (type === 'response.failed' || type === 'error') {
+        const msg = evt.response?.error?.message ?? evt.error?.message ?? 'ChatGPT Responses stream failed';
+        throw new Error(`ChatGPT Responses stream error: ${msg}`);
+      }
+    }
+
+    return this.toCompletionResponse({
+      ...completed,
+      output: [
+        ...(text ? [{ type: 'message', content: [{ type: 'output_text', text }] }] : []),
+        ...toolCalls.map((toolCall) => ({
+          type: 'function_call',
+          call_id: toolCall.id,
+          name: toolCall.function.name,
+          arguments: toolCall.function.arguments,
+        })),
+      ],
+    }, modelId);
   }
 
   private toCompletionResponse(json: ResponsesApiResponse, modelId: string): ChatCompletionResponse {
