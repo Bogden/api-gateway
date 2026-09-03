@@ -357,6 +357,57 @@ describe('ChatGptProvider', () => {
     expect(legacy.body.prompt_cache_key).not.toBe(a.body.prompt_cache_key);
   });
 
+  // c6754 — Claude Code >= 2.1.259 appends a per-turn `<total_tokens>N tokens left</total_tokens>`
+  // system message at the TAIL of the conversation. `instructions` is front-loaded and hashed into
+  // prompt_cache_key, so hoisting one rewrote the front of the cached prefix and the cache
+  // namespace on every turn: measured 20.6% of prompt tokens served from cache on 2.1.259 vs 93.1%
+  // on 2.1.226. Only leading system material may reach `instructions`.
+  it('keeps a mid-conversation system reminder in place instead of hoisting it into instructions', async () => {
+    writeLogin();
+    const calls: Array<{ body: any }> = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      calls.push({ body: JSON.parse((init as any).body) });
+      return sseResponse([
+        'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
+      ]);
+    });
+
+    const turn = (budget: number) =>
+      collect(provider.streamChatCompletion(
+        'no-key',
+        [
+          { role: 'system', content: 'be terse' },
+          { role: 'system', content: 'and precise' },
+          { role: 'user', content: 'first turn' },
+          { role: 'assistant', content: 'ok' },
+          { role: 'system', content: `<total_tokens>${budget} tokens left</total_tokens>` },
+          { role: 'user', content: 'second turn' },
+        ],
+        'gpt-5-codex',
+        { prompt_cache_key: 'ccsession:abc' },
+      ));
+
+    await turn(14965669);
+    await turn(14964540);
+    const [a, b] = calls;
+
+    // Both leading system messages still form the instructions; the tail reminder does not.
+    expect(a.body.instructions).toBe('be terse\n\nand precise');
+    expect(a.body.instructions).not.toContain('total_tokens');
+
+    // The reminder survives, in its original position — after the assistant turn, before the
+    // user turn that followed it.
+    const roles = a.body.input.map((i: any) => `${i.role}:${JSON.stringify(i.content ?? '')}`);
+    expect(roles[0]).toContain('first turn');
+    expect(roles[1]).toContain('ok');
+    expect(roles[2]).toBe('user:[{"type":"input_text","text":"<total_tokens>14965669 tokens left</total_tokens>"}]');
+    expect(roles[3]).toContain('second turn');
+
+    // A changed budget must leave the cached prefix's front — instructions and cache key — alone.
+    expect(b.body.instructions).toBe(a.body.instructions);
+    expect(b.body.prompt_cache_key).toBe(a.body.prompt_cache_key);
+  });
+
   it('fails fast on a deterministic 400 (marked non-retryable, upstream error passed through)', async () => {
     writeLogin();
     const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({

@@ -198,13 +198,28 @@ export class ChatGptProvider extends BaseProvider {
     let blobsCompressed = 0;
     let charsBefore = 0;
     let charsAfter = 0;
+    // `instructions` is a single front-loaded string, so anything folded into it sits ahead of
+    // the whole conversation in the cached prefix — and it is hashed into prompt_cache_key too.
+    // Only the LEADING system material may go there. A client that emits a system message in the
+    // middle of a conversation is emitting a per-turn reminder (Claude Code >= 2.1.259 appends a
+    // `<total_tokens>N tokens left</total_tokens>` message after nearly every turn); hoisting one
+    // rewrites the front of the prefix and the cache namespace on every turn, so the whole prompt
+    // is repaid uncached. Keep those in place instead. (card c6754)
+    let conversationStarted = false;
 
     for (const m of messages) {
       if (m.role === 'system') {
         const text = contentToString(m.content ?? '');
-        if (text) systemParts.push(text);
+        if (!text) continue;
+        if (!conversationStarted) {
+          systemParts.push(text);
+          continue;
+        }
+        flushToolImageCarriers();
+        input.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text }] });
         continue;
       }
+      conversationStarted = true;
       if (m.role === 'tool') {
         const result = toolResultInput(m.content ?? '');
         const output = compressionEnabled ? compressBlob(result.text) : result.text;
