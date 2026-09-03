@@ -400,7 +400,7 @@ describe('ChatGptProvider', () => {
     const roles = a.body.input.map((i: any) => `${i.role}:${JSON.stringify(i.content ?? '')}`);
     expect(roles[0]).toContain('first turn');
     expect(roles[1]).toContain('ok');
-    expect(roles[2]).toBe('user:[{"type":"input_text","text":"<total_tokens>14965669 tokens left</total_tokens>"}]');
+    expect(roles[2]).toBe('user:[{"type":"input_text","text":"<system-reminder>\\n<total_tokens>14965669 tokens left</total_tokens>\\n</system-reminder>"}]');
     expect(roles[3]).toContain('second turn');
 
     // A changed budget must leave the cached prefix's front — instructions and cache key — alone.

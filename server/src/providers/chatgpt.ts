@@ -216,7 +216,13 @@ export class ChatGptProvider extends BaseProvider {
           continue;
         }
         flushToolImageCarriers();
-        input.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text }] });
+        // Marked as a reminder, not user speech, and matching what the second gateway checkout
+        // already emits for the same case.
+        input.push({
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: `<system-reminder>\n${text}\n</system-reminder>` }],
+        });
         continue;
       }
       conversationStarted = true;
