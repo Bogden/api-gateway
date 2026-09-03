@@ -243,7 +243,7 @@ export function canUseProvider(platform: string, keyId: number, now = Date.now()
   return providerDailyRequestCount(platform, keyId, now) < cap;
 }
 
-export function recordRequest(platform: string, modelId: string, keyId: number) {
+function recordRequestUsage(platform: string, modelId: string, keyId: number) {
   const now = Date.now();
 
   const rpmKey = `${platform}:${modelId}:${keyId}:rpm`;
@@ -253,12 +253,32 @@ export function recordRequest(platform: string, modelId: string, keyId: number) 
   getWindow(rpdKey).timestamps.push(now);
 
   recordUsage(platform, modelId, keyId, 'request', 0, now);
+}
+
+export function recordRequest(platform: string, modelId: string, keyId: number) {
+  recordRequestUsage(platform, modelId, keyId);
   // The fact that we just served a request through this key is the
   // strongest possible signal that it's not actually broken — promote
   // it back to 'healthy' if a transport error had previously marked it
   // 'error'. Cheap (one indexed UPDATE) and self-healing: keys stuck
   // on 'error' from a past network blip get cleared on their next use.
   markKeyHealthyFromRequest(keyId);
+}
+
+/** Count an attempt that REACHED the provider and came back a failure (429,
+ *  4xx/5xx, or a 200 whose turn was dead). The provider charged its request
+ *  quota for it exactly like a success, so the rpm/rpd windows and the
+ *  provider-wide daily cap must move — recording only successes makes the
+ *  limiter go blind precisely when a provider starts rejecting us, and it keeps
+ *  sending. Callers gate this on `attemptReachedProvider` so a failure that
+ *  never left the box (client abort, connection refused, DNS/transport death)
+ *  is not charged to the provider.
+ *
+ *  Unlike `recordRequest` this does NOT promote the key to 'healthy': a
+ *  rejected call is no evidence the key works. Tokens are deliberately not
+ *  recorded — a failed turn has no trustworthy usage figure. */
+export function recordFailedRequest(platform: string, modelId: string, keyId: number) {
+  recordRequestUsage(platform, modelId, keyId);
 }
 
 export function recordTokens(

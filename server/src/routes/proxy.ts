@@ -5,12 +5,17 @@ import { z } from 'zod';
 import type { ChatMessage, ModelListRow } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
 import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
-import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
+import { recordRequest, recordFailedRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
+// NOTE: this route still carries its OWN copy of isRetryableError further down
+// rather than importing the shared classifier; only the reached-the-provider
+// question is taken from the lib here. Consolidating the duplicate is left to
+// the gateway reconciliation, not smuggled into this fix.
+import { attemptReachedProvider } from '../lib/error-classify.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
@@ -1519,6 +1524,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       const safeError = sanitizeProviderErrorMessage(err.message);
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
 
+      // Charge the attempt to the limiter even though it failed. The ledger
+      // used to move only on success, so a provider that started rejecting us
+      // froze the rpm/rpd counters and the provider-wide daily cap — the
+      // limiter went blind (and kept routing) exactly when it needed to back
+      // off. Gated so a failure that never reached the provider (transport
+      // death; client aborts already returned above) isn't charged to it.
+      if (attemptReachedProvider(err)) {
+        recordFailedRequest(route.platform, route.modelId, route.keyId);
+      }
 
       if (isRetryableError(err)) {
         // Dead-turn errors (in-band error, empty completion, stream stall,

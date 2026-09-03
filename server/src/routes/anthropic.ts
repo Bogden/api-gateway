@@ -661,6 +661,13 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
 
       sendError(res, 502, 'api_error', `Provider error (${route.displayName}): ${safeError}`);
       return;
+    } finally {
+      // `routeRequest` reserved this provider's in-flight slot; this route
+      // never gave it back, so every /v1/messages request permanently consumed
+      // one and a provider with maxParallelRequests set eventually looked full
+      // forever. One reservation per attempt, one release per attempt — the
+      // handle is one-shot, so it cannot double-decrement either.
+      route.release();
     }
   }
 

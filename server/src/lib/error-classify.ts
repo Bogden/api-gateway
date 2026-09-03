@@ -68,6 +68,24 @@ export function isRetryableError(err: any): boolean {
     || msg.includes('unparseable inline tool-call dialect');
 }
 
+/** Did this attempt actually REACH the provider and come back a failure (as
+ *  opposed to dying on our side of the wire)? The provider charged its request
+ *  quota for anything that reached it, so the rpm/rpd ledger must move for
+ *  these and must NOT move for a client abort, a connection refusal, or a
+ *  DNS/TLS death that never left the box. */
+export function attemptReachedProvider(err: any): boolean {
+  if (!err) return false;
+  if (typeof err.status === 'number' && err.status >= 400) return true;
+  if (err.name === 'ProviderTimeoutError') return true;
+  const msg = (err.message ?? '').toLowerCase();
+  if (/api error \d{3}/.test(msg)) return true;
+  return msg.includes('empty completion')
+    || msg.includes('in-band provider error')
+    || msg.includes('stream ended unexpectedly')
+    || msg.includes('stream stalled')
+    || msg.includes('unparseable inline tool-call dialect');
+}
+
 // A 402 Payment Required / out-of-credits error. Distinct from a transient 429:
 // it won't recover on the next window, so the caller benches the model+key with
 // PAYMENT_REQUIRED_COOLDOWN_MS (a full day) rather than the 90s transient cooldown.

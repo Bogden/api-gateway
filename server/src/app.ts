@@ -96,8 +96,15 @@ export function createApp() {
   // `/api/custom-providers` paths. We mount the router at root, but
   // requireAuth only runs for matching paths via a conditional. This
   // keeps `/api/ping` and `/api/auth/*` (intentionally public) free.
+  //
+  // The test must see exactly what Express routes on, or the gate is
+  // bypassable: `req.path` is the parsed pathname (`req.url` still carries the
+  // query string, so `/api/custom-providers?x=1` failed the `(\/|$)` anchor and
+  // walked past the gate straight into the handler), and the `i` flag matches
+  // Express's default case-insensitive routing (`/API/Custom-Providers` is
+  // routed to the same handler).
   app.use((req, res, next) => {
-    if (!/^\/api\/(custom-providers|custom-models)(\/|$)/.test(req.url)) return next();
+    if (!/^\/api\/(custom-providers|custom-models)(\/|$)/i.test(req.path)) return next();
     requireAuth(req, res, next);
   }, customRouter);
   app.use('/v1', createProxyRateLimiter());

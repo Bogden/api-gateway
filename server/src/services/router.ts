@@ -71,8 +71,11 @@ export interface RouteResult {
    * proxy as a fallback `max_tokens` when the caller doesn't supply one
    * (NVIDIA NIM minimax-m3 returns empty 200s without an explicit limit). */
   maxOutputTokens: number | null;
-  // Decrements the in-flight slot for the associated provider.
-  // Callers MUST invoke this in a finally block after the request completes.
+  // Decrements the in-flight slot for the associated provider. One route =
+  // one reservation = one release: callers MUST invoke this in a finally block
+  // that wraps the WHOLE request (all of its retries), not one per attempt.
+  // The handle is one-shot, so calling it again is a no-op rather than a
+  // decrement that steals a concurrent request's slot.
   release: () => void;
 }
 
@@ -103,6 +106,25 @@ function tryReserveSlot(platform: string, maxParallel: number | null): boolean {
 function releaseSlot(platform: string): void {
   const entry = providerInFlight.get(platform);
   if (entry && entry.count > 0) entry.count--;
+}
+
+/** Build the one-shot release handle handed to a caller with its route. A
+ *  request owns exactly one reservation for its whole lifetime, so the handle
+ *  decrements at most once no matter how often it is called — a retry loop that
+ *  releases per attempt, or a `finally` running after an early return already
+ *  released, must not hand the provider's capacity to the next caller. */
+function makeSlotRelease(platform: string): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseSlot(platform);
+  };
+}
+
+/** Slots currently reserved for a platform (diagnostics and tests). */
+export function getInFlightCount(platform: string): number {
+  return providerInFlight.get(platform)?.count ?? 0;
 }
 
 // ── Dynamic priority: track 429s per model and demote accordingly ──
@@ -713,7 +735,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       }
 
       // Build the release function so callers can decrement the slot.
-      const release = () => releaseSlot(entry.platform);
+      const release = makeSlotRelease(entry.platform);
 
       return {
         provider: provider,
@@ -764,7 +786,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
           releaseSlot(entry.platform);
           continue;
         }
-        const release = () => releaseSlot(entry.platform);
+        const release = makeSlotRelease(entry.platform);
         return {
           provider: provider,
           modelId: entry.model_id,
